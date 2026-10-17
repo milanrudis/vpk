@@ -2,6 +2,24 @@
 mod database;
 use database::InstalledPackage;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
+
+const REPO_INDEX_URL: &str =
+    "https://raw.githubusercontent.com/milanrudis/vast-packages/main/repo/index.toml";
+
+#[derive(Debug, Deserialize)]
+struct RepoIndex {
+    package: Vec<RepoPackage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepoPackage {
+    name: String,
+    version: String,
+    description: String,
+    url: String,
+    sha256: String,
+}
 use std::{
     env,
     fs::{self, File, OpenOptions},
@@ -273,6 +291,138 @@ fn install_package(
     Ok(package)
 }
 
+fn fetch_repository_index() -> Result<RepoIndex, String> {
+    let response = ureq::get(REPO_INDEX_URL)
+        .call()
+        .map_err(|e| format!("could not fetch repository index: {e}"))?;
+
+    let mut contents = String::new();
+
+    response
+        .into_reader()
+        .read_to_string(&mut contents)
+        .map_err(|e| format!("could not read repository index: {e}"))?;
+
+    toml::from_str(&contents)
+        .map_err(|e| format!("could not parse repository index: {e}"))
+}
+
+
+fn install_repository_package(name: &str) -> Result<(Package, PathBuf), String> {
+    fn safe_component(value: &str) -> bool {
+        !value.is_empty()
+            && value != "."
+            && value != ".."
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    }
+
+    if !safe_component(name) {
+        return Err("Invalid package name".into());
+    }
+
+    let index = fetch_repository_index()?;
+
+    let repo_package = index
+        .package
+        .iter()
+        .find(|package| package.name == name)
+        .ok_or_else(|| format!("Package '{name}' was not found in the repository"))?;
+
+    if !safe_component(&repo_package.version) {
+        return Err("Invalid package version in repository index".into());
+    }
+
+    if !repo_package.url.starts_with("https://") {
+        return Err("Package URL must use HTTPS".into());
+    }
+
+    println!("Downloading {} {}...", repo_package.name, repo_package.version);
+
+    let response = ureq::get(&repo_package.url)
+        .call()
+        .map_err(|e| format!("Could not download package: {e}"))?;
+
+    let mut bytes = Vec::new();
+
+    response
+        .into_reader()
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("Could not read downloaded package: {e}"))?;
+
+    let actual_hash = format!("{:x}", Sha256::digest(&bytes));
+    let expected_hash = repo_package.sha256.trim().to_ascii_lowercase();
+
+    if actual_hash != expected_hash {
+        return Err(format!(
+            "SHA-256 mismatch! Expected {}, got {}",
+            expected_hash, actual_hash
+        ));
+    }
+
+    println!("Checksum verified.");
+
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "Could not determine your home directory".to_string())?;
+
+    let cache = home.join(".cache/vpk/packages");
+
+    fs::create_dir_all(&cache)
+        .map_err(|e| format!("Could not create package cache: {e}"))?;
+
+    let archive_path = cache.join(format!(
+        "{}-{}-{}.vpk",
+        name,
+        repo_package.version,
+        process::id()
+    ));
+
+    let mut archive_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&archive_path)
+        .map_err(|e| format!("Could not create temporary package file: {e}"))?;
+
+    if let Err(error) = (|| -> io::Result<()> {
+        use io::Write;
+        archive_file.write_all(&bytes)?;
+        archive_file.flush()
+    })() {
+        let _ = fs::remove_file(&archive_path);
+        return Err(format!("Could not save downloaded package: {error}"));
+    }
+
+    let result = (|| -> Result<(Package, PathBuf), String> {
+        let archive_string = archive_path
+            .to_str()
+            .ok_or_else(|| "Invalid temporary package path".to_string())?;
+
+        let manifest = inspect_package(archive_string)?;
+
+        if manifest.name != repo_package.name
+            || manifest.version != repo_package.version
+        {
+            return Err("Downloaded package manifest does not match repository index".into());
+        }
+
+        let target = home.join(".local/share/vpk/root");
+        let target_string = target
+            .to_str()
+            .ok_or_else(|| "Invalid installation path".to_string())?;
+
+        let installed = install_package(archive_string, target_string)?;
+
+        Ok((installed, target))
+    })();
+
+    let _ = fs::remove_file(&archive_path);
+
+    result
+}
+
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -283,7 +433,41 @@ fn main() {
     }
 
     match args[1].as_str() {
-        "remove" => {
+	"search" => {
+    if args.len() != 3 {
+        eprintln!("Usage: vpk search <query>");
+        std::process::exit(1);
+    }
+
+    let query = args[2].to_lowercase();
+
+    match fetch_repository_index() {
+        Ok(index) => {
+            let matches: Vec<_> = index
+                .package
+                .iter()
+                .filter(|package| {
+                    package.name.to_lowercase().contains(&query)
+                        || package.description.to_lowercase().contains(&query)
+                })
+                .collect();
+
+            if matches.is_empty() {
+                println!("No packages found matching '{query}'.");
+            } else {
+                for package in matches {
+                    println!("{} {} - {}", package.name, package.version, package.description);
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("vpk: {error}");
+            std::process::exit(1);
+        }
+    }
+}    
+
+	"remove" => {
             if args.len() != 4 {
                 eprintln!("Usage: vpk remove <package-name> <target-directory>");
                 process::exit(1);
@@ -467,26 +651,43 @@ fn main() {
             }
         }
 
+        
         "install" => {
-            if args.len() != 4 {
-                eprintln!(
-                    "Usage: vpk install <package.vpk> <target-directory>"
-                );
-                process::exit(1);
-            }
+            if args.len() == 3 {
+                let name = &args[2];
 
-            match install_package(&args[2], &args[3]) {
-                Ok(package) => {
-                    println!(
-                        "Installed {} {} successfully!",
-                        package.name, package.version
-                    );
-                    println!("Location: {}", args[3]);
+                match install_repository_package(name) {
+                    Ok((package, target)) => {
+                        println!(
+                            "Installed {} {} successfully!",
+                            package.name, package.version
+                        );
+                        println!("Location: {}", target.display());
+                    }
+                    Err(error) => {
+                        eprintln!("vpk: could not install package: {error}");
+                        process::exit(1);
+                    }
                 }
-                Err(error) => {
-                    eprintln!("vpk: could not install package: {error}");
-                    process::exit(1);
+            } else if args.len() == 4 {
+                match install_package(&args[2], &args[3]) {
+                    Ok(package) => {
+                        println!(
+                            "Installed {} {} successfully!",
+                            package.name, package.version
+                        );
+                        println!("Location: {}", args[3]);
+                    }
+                    Err(error) => {
+                        eprintln!("vpk: could not install package: {error}");
+                        process::exit(1);
+                    }
                 }
+            } else {
+                eprintln!("Usage:");
+                eprintln!("  vpk install <package-name>");
+                eprintln!("  vpk install <package.vpk> <target-directory>");
+                process::exit(1);
             }
         }
 
