@@ -1,0 +1,10 @@
+[package]
+name = "vpk"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+tar = "0.4.46"
+toml = "1.1.8"
+zstd = "0.14.3"
