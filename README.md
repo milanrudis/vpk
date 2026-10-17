@@ -1,2 +1,2 @@
-# vesper-vpk
-a lightweight package manager for vesper based on rust.
+# VPK
+# a lightweight package manager for vast based on rust.
