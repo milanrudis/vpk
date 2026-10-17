@@ -1,4 +1,3 @@
-
 mod database;
 use database::InstalledPackage;
 use serde::Deserialize;
@@ -40,22 +39,22 @@ struct Package {
 
 // Read package information from a compressed .vpk archive.
 fn inspect_package(path: &str) -> Result<Package, String> {
-    let file = File::open(path)
-        .map_err(|e| format!("Could not open '{path}': {e}"))?;
+    let file = File::open(path).map_err(|e| format!("Could not open '{path}': {e}"))?;
 
-    let decoder = zstd::Decoder::new(file)
-        .map_err(|e| format!("Could not decompress package: {e}"))?;
+    let decoder =
+        zstd::Decoder::new(file).map_err(|e| format!("Could not decompress package: {e}"))?;
 
     let mut archive = Archive::new(decoder);
 
-    let entries = archive.entries()
+    let entries = archive
+        .entries()
         .map_err(|e| format!("Could not read archive: {e}"))?;
 
     for entry in entries {
-        let mut entry = entry
-            .map_err(|e| format!("Could not read archive entry: {e}"))?;
+        let mut entry = entry.map_err(|e| format!("Could not read archive entry: {e}"))?;
 
-        let path = entry.path()
+        let path = entry
+            .path()
             .map_err(|e| format!("Invalid archive path: {e}"))?
             .into_owned();
 
@@ -66,11 +65,11 @@ fn inspect_package(path: &str) -> Result<Package, String> {
 
             let mut contents = String::new();
 
-            entry.read_to_string(&mut contents)
+            entry
+                .read_to_string(&mut contents)
                 .map_err(|e| format!("Could not read manifest: {e}"))?;
 
-            return toml::from_str(&contents)
-                .map_err(|e| format!("Invalid package manifest: {e}"));
+            return toml::from_str(&contents).map_err(|e| format!("Invalid package manifest: {e}"));
         }
     }
 
@@ -99,10 +98,7 @@ fn pack_package(directory: &str, output: &str) -> io::Result<()> {
     let encoder = zstd::Encoder::new(file, 3)?;
     let mut archive = Builder::new(encoder);
 
-    archive.append_path_with_name(
-        root.join("manifest.toml"),
-        "manifest.toml",
-    )?;
+    archive.append_path_with_name(root.join("manifest.toml"), "manifest.toml")?;
 
     archive.append_dir_all("data", root.join("data"))?;
 
@@ -120,10 +116,7 @@ fn package_data_path(path: &Path) -> Result<PathBuf, String> {
     match components.next() {
         Some(Component::Normal(name)) if name == "data" => {}
         _ => {
-            return Err(format!(
-                "Unexpected path in package: {}",
-                path.display()
-            ));
+            return Err(format!("Unexpected path in package: {}", path.display()));
         }
     }
 
@@ -133,10 +126,7 @@ fn package_data_path(path: &Path) -> Result<PathBuf, String> {
         match component {
             Component::Normal(name) => relative.push(name),
             _ => {
-                return Err(format!(
-                    "Unsafe path in package: {}",
-                    path.display()
-                ));
+                return Err(format!("Unsafe path in package: {}", path.display()));
             }
         }
     }
@@ -163,9 +153,7 @@ fn ensure_directory(root: &Path, relative: &Path) -> io::Result<()> {
 
         match fs::symlink_metadata(&current) {
             Ok(metadata) => {
-                if metadata.file_type().is_symlink()
-                    || !metadata.is_dir()
-                {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!(
@@ -186,37 +174,33 @@ fn ensure_directory(root: &Path, relative: &Path) -> io::Result<()> {
 }
 
 // Install files into a chosen directory, not the live operating system.
-fn install_package(
-    package_path: &str,
-    target: &str,
-) -> Result<Package, String> {
+fn install_package(package_path: &str, target: &str) -> Result<Package, String> {
     // Validate the manifest before installing anything.
     let package = inspect_package(package_path)?;
 
-    fs::create_dir_all(target)
-        .map_err(|e| format!("Could not create install directory: {e}"))?;
+    fs::create_dir_all(target).map_err(|e| format!("Could not create install directory: {e}"))?;
 
     let root = fs::canonicalize(target)
         .map_err(|e| format!("Could not resolve install directory: {e}"))?;
 
     let mut installed_files: Vec<String> = Vec::new();
 
-    let file = File::open(package_path)
-        .map_err(|e| format!("Could not open package: {e}"))?;
+    let file = File::open(package_path).map_err(|e| format!("Could not open package: {e}"))?;
 
-    let decoder = zstd::Decoder::new(file)
-        .map_err(|e| format!("Could not decompress package: {e}"))?;
+    let decoder =
+        zstd::Decoder::new(file).map_err(|e| format!("Could not decompress package: {e}"))?;
 
     let mut archive = Archive::new(decoder);
 
-    let entries = archive.entries()
+    let entries = archive
+        .entries()
         .map_err(|e| format!("Could not read archive: {e}"))?;
 
     for entry in entries {
-        let mut entry = entry
-            .map_err(|e| format!("Could not read archive entry: {e}"))?;
+        let mut entry = entry.map_err(|e| format!("Could not read archive entry: {e}"))?;
 
-        let archive_path = entry.path()
+        let archive_path = entry
+            .path()
             .map_err(|e| format!("Invalid archive path: {e}"))?
             .into_owned();
 
@@ -235,18 +219,16 @@ fn install_package(
 
         if is_directory {
             ensure_directory(&root, &relative)
-                .map_err(|e| format!(
-                    "Could not create directory '{}': {e}",
-                    relative.display()
-                ))?;
+                .map_err(|e| format!("Could not create directory '{}': {e}", relative.display()))?;
         } else if is_file {
             let parent = relative.parent().unwrap_or(Path::new(""));
 
-            ensure_directory(&root, parent)
-                .map_err(|e| format!(
+            ensure_directory(&root, parent).map_err(|e| {
+                format!(
                     "Could not prepare directory for '{}': {e}",
                     relative.display()
-                ))?;
+                )
+            })?;
 
             installed_files.push(relative.to_string_lossy().into_owned());
 
@@ -257,16 +239,15 @@ fn install_package(
                 .write(true)
                 .create_new(true)
                 .open(&destination)
-                .map_err(|e| format!(
-                    "Could not create '{}': {e}. Existing files are not overwritten.",
-                    destination.display()
-                ))?;
+                .map_err(|e| {
+                    format!(
+                        "Could not create '{}': {e}. Existing files are not overwritten.",
+                        destination.display()
+                    )
+                })?;
 
             io::copy(&mut entry, &mut output)
-                .map_err(|e| format!(
-                    "Could not write '{}': {e}",
-                    destination.display()
-                ))?;
+                .map_err(|e| format!("Could not write '{}': {e}", destination.display()))?;
         } else {
             return Err(format!(
                 "Unsupported archive entry type: {}",
@@ -284,9 +265,7 @@ fn install_package(
             files: installed_files,
         },
     )
-    .map_err(|e| {
-        format!("Could not save installed-package record: {e}")
-    })?;
+    .map_err(|e| format!("Could not save installed-package record: {e}"))?;
 
     Ok(package)
 }
@@ -303,10 +282,8 @@ fn fetch_repository_index() -> Result<RepoIndex, String> {
         .read_to_string(&mut contents)
         .map_err(|e| format!("could not read repository index: {e}"))?;
 
-    toml::from_str(&contents)
-        .map_err(|e| format!("could not parse repository index: {e}"))
+    toml::from_str(&contents).map_err(|e| format!("could not parse repository index: {e}"))
 }
-
 
 fn install_repository_package(name: &str) -> Result<(Package, PathBuf), String> {
     fn safe_component(value: &str) -> bool {
@@ -338,7 +315,10 @@ fn install_repository_package(name: &str) -> Result<(Package, PathBuf), String> 
         return Err("Package URL must use HTTPS".into());
     }
 
-    println!("Downloading {} {}...", repo_package.name, repo_package.version);
+    println!(
+        "Downloading {} {}...",
+        repo_package.name, repo_package.version
+    );
 
     let response = ureq::get(&repo_package.url)
         .call()
@@ -369,8 +349,7 @@ fn install_repository_package(name: &str) -> Result<(Package, PathBuf), String> 
 
     let cache = home.join(".cache/vpk/packages");
 
-    fs::create_dir_all(&cache)
-        .map_err(|e| format!("Could not create package cache: {e}"))?;
+    fs::create_dir_all(&cache).map_err(|e| format!("Could not create package cache: {e}"))?;
 
     let archive_path = cache.join(format!(
         "{}-{}-{}.vpk",
@@ -401,9 +380,7 @@ fn install_repository_package(name: &str) -> Result<(Package, PathBuf), String> 
 
         let manifest = inspect_package(archive_string)?;
 
-        if manifest.name != repo_package.name
-            || manifest.version != repo_package.version
-        {
+        if manifest.name != repo_package.name || manifest.version != repo_package.version {
             return Err("Downloaded package manifest does not match repository index".into());
         }
 
@@ -422,7 +399,6 @@ fn install_repository_package(name: &str) -> Result<(Package, PathBuf), String> 
     result
 }
 
-
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -433,50 +409,66 @@ fn main() {
     }
 
     match args[1].as_str() {
-	"search" => {
-    if args.len() != 3 {
-        eprintln!("Usage: vpk search <query>");
-        std::process::exit(1);
-    }
+        "search" => {
+            if args.len() != 3 {
+                eprintln!("Usage: vpk search <query>");
+                std::process::exit(1);
+            }
 
-    let query = args[2].to_lowercase();
+            let query = args[2].to_lowercase();
 
-    match fetch_repository_index() {
-        Ok(index) => {
-            let matches: Vec<_> = index
-                .package
-                .iter()
-                .filter(|package| {
-                    package.name.to_lowercase().contains(&query)
-                        || package.description.to_lowercase().contains(&query)
-                })
-                .collect();
+            match fetch_repository_index() {
+                Ok(index) => {
+                    let matches: Vec<_> = index
+                        .package
+                        .iter()
+                        .filter(|package| {
+                            package.name.to_lowercase().contains(&query)
+                                || package.description.to_lowercase().contains(&query)
+                        })
+                        .collect();
 
-            if matches.is_empty() {
-                println!("No packages found matching '{query}'.");
-            } else {
-                for package in matches {
-                    println!("{} {} - {}", package.name, package.version, package.description);
+                    if matches.is_empty() {
+                        println!("No packages found matching '{query}'.");
+                    } else {
+                        for package in matches {
+                            println!(
+                                "{} {} - {}",
+                                package.name, package.version, package.description
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!("vpk: {error}");
+                    std::process::exit(1);
                 }
             }
         }
-        Err(error) => {
-            eprintln!("vpk: {error}");
-            std::process::exit(1);
-        }
-    }
-}    
 
-	"remove" => {
-            if args.len() != 4 {
-                eprintln!("Usage: vpk remove <package-name> <target-directory>");
+        "remove" => {
+            if args.len() != 3 && args.len() != 4 {
+                eprintln!("Usage:");
+                eprintln!("  vpk remove <package-name>");
+                eprintln!("  vpk remove <package-name> <target-directory>");
                 process::exit(1);
             }
 
             let name = &args[2];
-            let target = &args[3];
 
-            let root = match fs::canonicalize(target) {
+            let target = if args.len() == 3 {
+                match env::var_os("HOME") {
+                    Some(home) => PathBuf::from(home).join(".local/share/vpk/root"),
+                    None => {
+                        eprintln!("vpk: could not determine your home directory");
+                        process::exit(1);
+                    }
+                }
+            } else {
+                PathBuf::from(&args[3])
+            };
+
+            let root = match fs::canonicalize(&target) {
                 Ok(root) => root,
                 Err(error) => {
                     eprintln!("vpk: could not access target directory: {error}");
@@ -528,10 +520,7 @@ fn main() {
 
             match database::remove_installed(&root, name) {
                 Ok(package) => {
-                    println!(
-                        "Successfully removed {} {}.",
-                        package.name, package.version
-                    );
+                    println!("Successfully removed {} {}.", package.name, package.version);
                 }
                 Err(error) => {
                     eprintln!("vpk: could not remove package: {error}");
@@ -540,18 +529,30 @@ fn main() {
             }
         }
 
-	"list" => {
-            if args.len() != 3 {
-                eprintln!("Usage: vpk list <target-directory>");
+        "list" => {
+            if args.len() > 3 {
+                eprintln!("Usage:");
+                eprintln!("  vpk list");
+                eprintln!("  vpk list <target-directory>");
                 process::exit(1);
             }
 
-            let root = match fs::canonicalize(&args[2]) {
+            let target = if args.len() == 2 {
+                match env::var_os("HOME") {
+                    Some(home) => PathBuf::from(home).join(".local/share/vpk/root"),
+                    None => {
+                        eprintln!("vpk: could not determine your home directory");
+                        process::exit(1);
+                    }
+                }
+            } else {
+                PathBuf::from(&args[2])
+            };
+
+            let root = match fs::canonicalize(&target) {
                 Ok(root) => root,
                 Err(error) => {
-                    eprintln!(
-                        "vpk: could not access target directory: {error}"
-                    );
+                    eprintln!("vpk: could not access target directory: {error}");
                     process::exit(1);
                 }
             };
@@ -575,7 +576,7 @@ fn main() {
                 }
             }
         }
-                
+
         "inspect" | "info" => {
             if args.len() == 3 && args[2].ends_with(".vpk") {
                 match inspect_package(&args[2]) {
@@ -598,11 +599,22 @@ fn main() {
                         process::exit(1);
                     }
                 }
-            } else if args.len() == 4 {
+            } else if args.len() == 3 || args.len() == 4 {
                 let name = &args[2];
-                let target = &args[3];
 
-                let root = match fs::canonicalize(target) {
+                let target = if args.len() == 3 {
+                    match env::var_os("HOME") {
+                        Some(home) => PathBuf::from(home).join(".local/share/vpk/root"),
+                        None => {
+                            eprintln!("vpk: could not determine your home directory");
+                            process::exit(1);
+                        }
+                    }
+                } else {
+                    PathBuf::from(&args[3])
+                };
+
+                let root = match fs::canonicalize(&target) {
                     Ok(root) => root,
                     Err(error) => {
                         eprintln!("vpk: could not access target directory: {error}");
@@ -627,8 +639,9 @@ fn main() {
                 }
             } else {
                 eprintln!("Usage:");
-                eprintln!("  vpk info <package.vpk>");
+                eprintln!("  vpk info <package-name>");
                 eprintln!("  vpk info <package-name> <target-directory>");
+                eprintln!("  vpk info <package.vpk>");
                 process::exit(1);
             }
         }
@@ -651,7 +664,6 @@ fn main() {
             }
         }
 
-        
         "install" => {
             if args.len() == 3 {
                 let name = &args[2];
@@ -696,19 +708,28 @@ fn main() {
         }
 
         "--help" | "-h" => {
-            println!("VPK - The Vesper Package Manager");
+            println!("VPK - The Vast Linux Package Manager");
+            println!();
+            println!("Usage:");
+            println!("  vpk <command> [arguments]");
             println!();
             println!("Commands:");
-	    println!("  remove <name> <target-directory> Remove a package");
-	    println!("  list <target-directory>        List installed packages");
-            println!("  pack <directory> <output.vpk>  Create a package");
-            println!("  info <package.vpk>             Show package information");
-	    println!("  inspect <package.vpk>          Inspect a package (alias for info)");
-            println!("  install <package.vpk> <dir>    Install into a directory");
+            println!("  search <query>                 Search available packages");
+            println!("  install <package-name>         Install a package from the repository");
+            println!("  install <package.vpk> <dir>     Install a local package archive");
+            println!("  list [target-directory]        List installed packages");
+            println!("  info <package-name>            Show installed package information");
+            println!("  info <package-name> <dir>      Show package info in a custom root");
+            println!("  info <package.vpk>              Inspect a package archive");
+            println!("  remove <package-name>          Remove an installed package");
+            println!("  remove <package-name> <dir>    Remove from a custom root");
+            println!("  pack <directory> <output.vpk>  Create a package archive");
+            println!("  inspect <package.vpk>          Inspect a package archive");
+            println!("  --version                      Show VPK version");
+            println!("  --help                         Show this help message");
             println!();
-            println!("Options:");
-            println!("  -V, --version                  Show version");
-            println!("  -h, --help                     Show this help");
+            println!("Default install root:");
+            println!("  ~/.local/share/vpk/root")
         }
 
         _ => {
@@ -716,5 +737,170 @@ fn main() {
             eprintln!("Try 'vpk --help' for more information.");
             process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn create_test_package(base: &Path) -> PathBuf {
+        let package_dir = base.join("test-package");
+        fs::create_dir_all(package_dir.join("data/usr/share")).unwrap();
+
+        fs::write(
+            package_dir.join("manifest.toml"),
+            r#"
+name = "test-package"
+version = "1.0.0"
+description = "A test package"
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            package_dir.join("data/usr/share/hello.txt"),
+            "Hello from VPK tests!",
+        )
+        .unwrap();
+
+        package_dir
+    }
+    use std::path::Path;
+
+    #[test]
+    fn accepts_normal_package_paths() {
+        assert_eq!(
+            package_data_path(Path::new("data/usr/share/hello.txt")).unwrap(),
+            PathBuf::from("usr/share/hello.txt")
+        );
+    }
+
+    #[test]
+    fn rejects_parent_directory_traversal() {
+        assert!(package_data_path(Path::new("../../etc/passwd")).is_err());
+        assert!(package_data_path(Path::new("data/../../etc/passwd")).is_err());
+    }
+
+    #[test]
+    fn rejects_absolute_paths() {
+        assert!(package_data_path(Path::new("/etc/passwd")).is_err());
+    }
+
+    #[test]
+    fn rejects_paths_outside_data_directory() {
+        assert!(package_data_path(Path::new("manifest.toml")).is_err());
+        assert!(package_data_path(Path::new("other/file.txt")).is_err());
+    }
+
+    #[test]
+    fn rejects_data_directory_without_a_filename() {
+        assert!(
+            package_data_path(Path::new("data"))
+                .unwrap()
+                .as_os_str()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn packs_and_inspects_package() {
+        let temp = env::temp_dir().join(format!("vpk-test-pack-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+
+        let package_dir = create_test_package(&temp);
+        let archive_path = temp.join("test-package.vpk");
+
+        pack_package(
+            package_dir.to_str().unwrap(),
+            archive_path.to_str().unwrap(),
+        )
+        .unwrap();
+
+        let package = inspect_package(archive_path.to_str().unwrap()).unwrap();
+
+        assert_eq!(package.name, "test-package");
+        assert_eq!(package.version, "1.0.0");
+        assert_eq!(package.description, "A test package");
+
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn refuses_to_pack_missing_manifest() {
+        let temp = env::temp_dir().join(format!("vpk-test-invalid-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(temp.join("data")).unwrap();
+
+        let output = temp.join("invalid.vpk");
+
+        let result = pack_package(temp.to_str().unwrap(), output.to_str().unwrap());
+
+        assert!(result.is_err());
+
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn installs_package_file_into_target() {
+        let temp = env::temp_dir().join(format!("vpk-test-install-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+
+        let package_dir = create_test_package(&temp);
+        let archive_path = temp.join("test-package.vpk");
+        let target = temp.join("install-root");
+
+        pack_package(
+            package_dir.to_str().unwrap(),
+            archive_path.to_str().unwrap(),
+        )
+        .unwrap();
+
+        let package =
+            install_package(archive_path.to_str().unwrap(), target.to_str().unwrap()).unwrap();
+
+        assert_eq!(package.name, "test-package");
+        assert_eq!(
+            fs::read_to_string(target.join("usr/share/hello.txt")).unwrap(),
+            "Hello from VPK tests!"
+        );
+
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn refuses_to_overwrite_existing_file() {
+        let temp = env::temp_dir().join(format!("vpk-test-overwrite-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+
+        let package_dir = create_test_package(&temp);
+        let archive_path = temp.join("test-package.vpk");
+        let target = temp.join("install-root");
+        let existing_file = target.join("usr/share/hello.txt");
+
+        fs::create_dir_all(existing_file.parent().unwrap()).unwrap();
+        fs::write(&existing_file, "DO NOT OVERWRITE").unwrap();
+
+        pack_package(
+            package_dir.to_str().unwrap(),
+            archive_path.to_str().unwrap(),
+        )
+        .unwrap();
+
+        let result = install_package(archive_path.to_str().unwrap(), target.to_str().unwrap());
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(&existing_file).unwrap(),
+            "DO NOT OVERWRITE"
+        );
+
+        fs::remove_dir_all(&temp).unwrap();
     }
 }

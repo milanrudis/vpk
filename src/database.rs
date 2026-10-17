@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -17,10 +16,7 @@ fn database_directory(root: &Path) -> PathBuf {
     root.join("var/lib/vpk/installed")
 }
 
-pub fn record_install(
-    root: &Path,
-    package: InstalledPackage,
-) -> io::Result<()> {
+pub fn record_install(root: &Path, package: InstalledPackage) -> io::Result<()> {
     // Only allow simple package names in database filenames.
     if package.name.is_empty()
         || !package
@@ -49,8 +45,7 @@ pub fn record_install(
         ));
     }
 
-    let contents = toml::to_string_pretty(&package)
-        .map_err(io::Error::other)?;
+    let contents = toml::to_string_pretty(&package).map_err(io::Error::other)?;
 
     fs::write(destination, contents)
 }
@@ -73,16 +68,15 @@ pub fn list_installed(root: &Path) -> io::Result<Vec<InstalledPackage>> {
 
         let contents = fs::read_to_string(&path)?;
 
-        let package: InstalledPackage = toml::from_str(&contents)
-            .map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Could not read package record '{}': {error}",
-                        path.display()
-                    ),
-                )
-            })?;
+        let package: InstalledPackage = toml::from_str(&contents).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Could not read package record '{}': {error}",
+                    path.display()
+                ),
+            )
+        })?;
 
         packages.push(package);
     }
@@ -91,10 +85,7 @@ pub fn list_installed(root: &Path) -> io::Result<Vec<InstalledPackage>> {
 
     Ok(packages)
 }
-pub fn get_installed(
-    root: &Path,
-    name: &str,
-) -> io::Result<Option<InstalledPackage>> {
+pub fn get_installed(root: &Path, name: &str) -> io::Result<Option<InstalledPackage>> {
     if name.is_empty()
         || !name
             .chars()
@@ -133,17 +124,13 @@ pub fn get_installed(
     }
 }
 
-pub fn remove_installed(
-    root: &Path,
-    name: &str,
-) -> io::Result<InstalledPackage> {
-    let package = get_installed(root, name)?
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Package '{name}' is not installed"),
-            )
-        })?;
+pub fn remove_installed(root: &Path, name: &str) -> io::Result<InstalledPackage> {
+    let package = get_installed(root, name)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Package '{name}' is not installed"),
+        )
+    })?;
 
     let directory = database_directory(root);
 
@@ -159,13 +146,12 @@ pub fn remove_installed(
         }
 
         let contents = fs::read_to_string(&record_path)?;
-        let other: InstalledPackage =
-            toml::from_str(&contents).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Invalid package record: {error}"),
-                )
-            })?;
+        let other: InstalledPackage = toml::from_str(&contents).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid package record: {error}"),
+            )
+        })?;
 
         for file in &package.files {
             if other.files.contains(file) {
@@ -187,9 +173,9 @@ pub fn remove_installed(
         let relative = Path::new(file);
 
         if relative.as_os_str().is_empty()
-            || !relative.components().all(|component| {
-                matches!(component, std::path::Component::Normal(_))
-            })
+            || !relative
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
