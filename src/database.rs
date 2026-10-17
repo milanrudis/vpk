@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    fs, io,
+    fs::{self, OpenOptions},
+    io::{self, Write},
     path::{Path, PathBuf},
+    process,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -36,19 +38,56 @@ pub fn record_install(root: &Path, package: InstalledPackage) -> io::Result<()> 
     fs::create_dir_all(&directory)?;
 
     let destination = directory.join(format!("{}.toml", package.name));
-
-    // Do not silently replace an existing package record.
-    if destination.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("A database record already exists for '{}'", package.name),
-        ));
-    }
-
     let contents = toml::to_string_pretty(&package).map_err(io::Error::other)?;
 
-    fs::write(destination, contents)
+    // Create a unique temporary file without overwriting anything.
+    let mut temporary = None;
+
+    for attempt in 0..100 {
+        let path = directory.join(format!(
+            ".{}.toml.tmp-{}-{attempt}",
+            package.name,
+            process::id()
+        ));
+
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => {
+                temporary = Some((path, file));
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    let (temporary_path, mut file) = temporary.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "Could not find an available temporary database filename",
+        )
+    })?;
+
+    // Write and flush the complete record before publishing it.
+    let result = (|| -> io::Result<()> {
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+
+        // A hard link publishes the record atomically and fails if the
+        // destination already exists, rather than replacing it.
+        fs::hard_link(&temporary_path, &destination)?;
+
+        Ok(())
+    })();
+
+    // Once published, the destination is the valid record. Removing the
+    // temporary link is best-effort so cleanup failure cannot report a
+    // failed install while leaving a successfully published record behind.
+    let _ = fs::remove_file(&temporary_path);
+
+    result
 }
+
 pub fn list_installed(root: &Path) -> io::Result<Vec<InstalledPackage>> {
     let directory = database_directory(root);
 
@@ -226,4 +265,45 @@ pub fn remove_installed(root: &Path, name: &str) -> io::Result<InstalledPackage>
     fs::remove_file(directory.join(format!("{name}.toml")))?;
 
     Ok(package)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_install_does_not_overwrite_record() {
+        let root = std::env::temp_dir().join(format!("vpk-db-test-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let original = InstalledPackage {
+            name: "duplicate-test".into(),
+            version: "1.0.0".into(),
+            description: "Original package".into(),
+            files: vec!["usr/bin/original".into()],
+        };
+
+        record_install(&root, original).unwrap();
+
+        let duplicate = InstalledPackage {
+            name: "duplicate-test".into(),
+            version: "2.0.0".into(),
+            description: "Replacement package".into(),
+            files: vec!["usr/bin/replacement".into()],
+        };
+
+        let result = record_install(&root, duplicate);
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+
+        let saved = get_installed(&root, "duplicate-test").unwrap().unwrap();
+
+        assert_eq!(saved.version, "1.0.0");
+        assert_eq!(saved.description, "Original package");
+        assert_eq!(saved.files, vec!["usr/bin/original"]);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

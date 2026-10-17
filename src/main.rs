@@ -134,8 +134,11 @@ fn package_data_path(path: &Path) -> Result<PathBuf, String> {
     Ok(relative)
 }
 
-// Create directories without following existing symbolic links.
-fn ensure_directory(root: &Path, relative: &Path) -> io::Result<()> {
+fn ensure_directory(
+    root: &Path,
+    relative: &Path,
+    created_dirs: &mut Vec<PathBuf>,
+) -> io::Result<()> {
     let mut current = root.to_path_buf();
 
     for component in relative.components() {
@@ -165,6 +168,7 @@ fn ensure_directory(root: &Path, relative: &Path) -> io::Result<()> {
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 fs::create_dir(&current)?;
+                created_dirs.push(current.clone());
             }
             Err(error) => return Err(error),
         }
@@ -173,9 +177,7 @@ fn ensure_directory(root: &Path, relative: &Path) -> io::Result<()> {
     Ok(())
 }
 
-// Install files into a chosen directory, not the live operating system.
 fn install_package(package_path: &str, target: &str) -> Result<Package, String> {
-    // Validate the manifest before installing anything.
     let package = inspect_package(package_path)?;
 
     fs::create_dir_all(target).map_err(|e| format!("Could not create install directory: {e}"))?;
@@ -184,88 +186,125 @@ fn install_package(package_path: &str, target: &str) -> Result<Package, String> 
         .map_err(|e| format!("Could not resolve install directory: {e}"))?;
 
     let mut installed_files: Vec<String> = Vec::new();
+    let mut created_files: Vec<PathBuf> = Vec::new();
+    let mut created_dirs: Vec<PathBuf> = Vec::new();
 
-    let file = File::open(package_path).map_err(|e| format!("Could not open package: {e}"))?;
+    let result = (|| -> Result<(), String> {
+        let file = File::open(package_path).map_err(|e| format!("Could not open package: {e}"))?;
 
-    let decoder =
-        zstd::Decoder::new(file).map_err(|e| format!("Could not decompress package: {e}"))?;
+        let decoder =
+            zstd::Decoder::new(file).map_err(|e| format!("Could not decompress package: {e}"))?;
 
-    let mut archive = Archive::new(decoder);
+        let mut archive = Archive::new(decoder);
+        let entries = archive
+            .entries()
+            .map_err(|e| format!("Could not read archive: {e}"))?;
 
-    let entries = archive
-        .entries()
-        .map_err(|e| format!("Could not read archive: {e}"))?;
+        for entry in entries {
+            let mut entry = entry.map_err(|e| format!("Could not read archive entry: {e}"))?;
 
-    for entry in entries {
-        let mut entry = entry.map_err(|e| format!("Could not read archive entry: {e}"))?;
+            let archive_path = entry
+                .path()
+                .map_err(|e| format!("Invalid archive path: {e}"))?
+                .into_owned();
 
-        let archive_path = entry
-            .path()
-            .map_err(|e| format!("Invalid archive path: {e}"))?
-            .into_owned();
-
-        // The manifest describes the package; it is not installed as a file.
-        if archive_path == Path::new("manifest.toml") {
-            if !entry.header().entry_type().is_file() {
-                return Err("Package manifest is not a regular file".into());
+            if archive_path == Path::new("manifest.toml") {
+                if !entry.header().entry_type().is_file() {
+                    return Err("Package manifest is not a regular file".into());
+                }
+                continue;
             }
-            continue;
-        }
 
-        let relative = package_data_path(&archive_path)?;
+            let relative = package_data_path(&archive_path)?;
+            let is_directory = entry.header().entry_type().is_dir();
+            let is_file = entry.header().entry_type().is_file();
 
-        let is_directory = entry.header().entry_type().is_dir();
-        let is_file = entry.header().entry_type().is_file();
+            if is_directory {
+                ensure_directory(&root, &relative, &mut created_dirs).map_err(|e| {
+                    format!("Could not create directory '{}': {e}", relative.display())
+                })?;
+            } else if is_file {
+                let parent = relative.parent().unwrap_or(Path::new(""));
 
-        if is_directory {
-            ensure_directory(&root, &relative)
-                .map_err(|e| format!("Could not create directory '{}': {e}", relative.display()))?;
-        } else if is_file {
-            let parent = relative.parent().unwrap_or(Path::new(""));
-
-            ensure_directory(&root, parent).map_err(|e| {
-                format!(
-                    "Could not prepare directory for '{}': {e}",
-                    relative.display()
-                )
-            })?;
-
-            installed_files.push(relative.to_string_lossy().into_owned());
-
-            let destination = root.join(&relative);
-
-            // Never overwrite an existing file.
-            let mut output = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&destination)
-                .map_err(|e| {
+                ensure_directory(&root, parent, &mut created_dirs).map_err(|e| {
                     format!(
-                        "Could not create '{}': {e}. Existing files are not overwritten.",
-                        destination.display()
+                        "Could not prepare directory for '{}': {e}",
+                        relative.display()
                     )
                 })?;
 
-            io::copy(&mut entry, &mut output)
-                .map_err(|e| format!("Could not write '{}': {e}", destination.display()))?;
-        } else {
-            return Err(format!(
-                "Unsupported archive entry type: {}",
-                archive_path.display()
-            ));
-        }
-    }
+                let destination = root.join(&relative);
 
-    database::record_install(
-        &root,
-        InstalledPackage {
-            name: package.name.clone(),
-            version: package.version.clone(),
-            description: package.description.clone(),
-            files: installed_files,
-        },
-    )
-    .map_err(|e| format!("Could not save installed-package record: {e}"))?;
+                let mut output = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&destination)
+                    .map_err(|e| {
+                        format!(
+                            "Could not create '{}': {e}. Existing files are not overwritten.",
+                            destination.display()
+                        )
+                    })?;
+
+                // Track the file immediately so even a partial write
+                // can be rolled back.
+                created_files.push(destination.clone());
+
+                io::copy(&mut entry, &mut output)
+                    .map_err(|e| format!("Could not write '{}': {e}", destination.display()))?;
+
+                installed_files.push(relative.to_string_lossy().into_owned());
+            } else {
+                return Err(format!(
+                    "Unsupported archive entry type: {}",
+                    archive_path.display()
+                ));
+            }
+        }
+
+        database::record_install(
+            &root,
+            InstalledPackage {
+                name: package.name.clone(),
+                version: package.version.clone(),
+                description: package.description.clone(),
+                files: installed_files.clone(),
+            },
+        )
+        .map_err(|e| format!("Could not save installed-package record: {e}"))?;
+
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        // Remove only files created by this installation.
+        for path in created_files.iter().rev() {
+            if let Err(cleanup_error) = fs::remove_file(path) {
+                if cleanup_error.kind() != io::ErrorKind::NotFound {
+                    eprintln!(
+                        "vpk: warning: could not roll back '{}': {cleanup_error}",
+                        path.display()
+                    );
+                }
+            }
+        }
+
+        // Remove only newly created directories, and only if empty.
+        for path in created_dirs.iter().rev() {
+            if let Err(cleanup_error) = fs::remove_dir(path) {
+                if cleanup_error.kind() != io::ErrorKind::NotFound
+                    && cleanup_error.kind() != io::ErrorKind::DirectoryNotEmpty
+                {
+                    eprintln!(
+                        "vpk: warning: could not clean up '{}': {cleanup_error}",
+                        path.display()
+                    );
+                }
+            }
+        }
+
+        return Err(error);
+    }
 
     Ok(package)
 }
@@ -899,6 +938,85 @@ description = "A test package"
         assert_eq!(
             fs::read_to_string(&existing_file).unwrap(),
             "DO NOT OVERWRITE"
+        );
+
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn rolls_back_files_and_directories_after_failed_install() {
+        let temp = env::temp_dir().join(format!("vpk-test-rollback-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+
+        let package_dir = temp.join("package");
+        fs::create_dir_all(package_dir.join("data/aaa-new/nested")).unwrap();
+        fs::create_dir_all(package_dir.join("data/usr/share")).unwrap();
+
+        fs::write(
+            package_dir.join("manifest.toml"),
+            r#"
+name = "rollback-test"
+version = "1.0.0"
+description = "Rollback test"
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            package_dir.join("data/aaa-new/nested/new.txt"),
+            "this file should be rolled back",
+        )
+        .unwrap();
+
+        fs::write(
+            package_dir.join("data/usr/share/hello.txt"),
+            "package version",
+        )
+        .unwrap();
+
+        let archive_path = temp.join("rollback-test.vpk");
+        pack_package(
+            package_dir.to_str().unwrap(),
+            archive_path.to_str().unwrap(),
+        )
+        .unwrap();
+
+        let target = temp.join("install-root");
+        let existing_file = target.join("usr/share/hello.txt");
+
+        fs::create_dir_all(existing_file.parent().unwrap()).unwrap();
+        fs::write(&existing_file, "original contents").unwrap();
+
+        let result = install_package(archive_path.to_str().unwrap(), target.to_str().unwrap());
+
+        assert!(
+            result.is_err(),
+            "installation should fail on the existing file"
+        );
+
+        assert_eq!(
+            fs::read_to_string(&existing_file).unwrap(),
+            "original contents",
+            "pre-existing files must remain untouched"
+        );
+
+        assert!(
+            !target.join("aaa-new").exists(),
+            "new directories should be removed during rollback"
+        );
+
+        assert!(
+            !target.join("aaa-new/nested/new.txt").exists(),
+            "new files should be removed during rollback"
+        );
+
+        assert!(
+            database::get_installed(&fs::canonicalize(&target).unwrap(), "rollback-test")
+                .unwrap()
+                .is_none(),
+            "failed installations must not leave a package record"
         );
 
         fs::remove_dir_all(&temp).unwrap();
