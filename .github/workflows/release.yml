@@ -1,0 +1,59 @@
+
+name: Build VPK Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build static musl binary
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl build tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools musl-dev
+
+      - name: Run tests
+        run: cargo test --target x86_64-unknown-linux-musl
+        env:
+          RUSTFLAGS: "-C link-arg=-static"
+
+      - name: Build release binary
+        run: cargo build --release --target x86_64-unknown-linux-musl
+        env:
+          RUSTFLAGS: "-C link-arg=-static"
+
+      - name: Smoke test release binary
+        run: ./target/x86_64-unknown-linux-musl/release/vpk --version
+
+      - name: Prepare release files
+        shell: bash
+        run: |
+          mkdir -p release
+          cp target/x86_64-unknown-linux-musl/release/vpk release/vpk-linux-x86_64-musl
+          chmod +x release/vpk-linux-x86_64-musl
+          cd release
+          sha256sum vpk-linux-x86_64-musl > vpk-linux-x86_64-musl.sha256
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            release/vpk-linux-x86_64-musl \
+            release/vpk-linux-x86_64-musl.sha256 \
+            --title "VPK ${GITHUB_REF_NAME}" \
+            --generate-notes
