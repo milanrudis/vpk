@@ -6,12 +6,12 @@ use sha2::{Digest, Sha256};
 const REPO_INDEX_URL: &str =
     "https://raw.githubusercontent.com/milanrudis/vast-packages/main/repo/index.toml";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct RepoIndex {
     package: Vec<RepoPackage>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct RepoPackage {
     name: String,
     version: String,
@@ -269,6 +269,7 @@ fn install_package(package_path: &str, target: &str) -> Result<Package, String> 
                 version: package.version.clone(),
                 description: package.description.clone(),
                 files: installed_files.clone(),
+                dependencies: package.dependencies.clone(),
             },
         )
         .map_err(|e| format!("Could not save installed-package record: {e}"))?;
@@ -324,29 +325,59 @@ fn fetch_repository_index() -> Result<RepoIndex, String> {
     toml::from_str(&contents).map_err(|e| format!("could not parse repository index: {e}"))
 }
 
-fn install_repository_package(name: &str) -> Result<(Package, PathBuf), String> {
-    fn safe_component(value: &str) -> bool {
-        !value.is_empty()
-            && value != "."
-            && value != ".."
-            && value
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+fn safe_package_component(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
+fn install_repository_package_recursive(
+    name: &str,
+    index: &RepoIndex,
+    target: &Path,
+    visiting: &mut Vec<String>,
+) -> Result<(Package, bool), String> {
+    if !safe_package_component(name) {
+        return Err(format!("Invalid package name: '{name}'"));
     }
 
-    if !safe_component(name) {
-        return Err("Invalid package name".into());
+    if visiting.iter().any(|item| item == name) {
+        let mut cycle = visiting.join(" -> ");
+        cycle.push_str(" -> ");
+        cycle.push_str(name);
+        return Err(format!("Circular dependency detected: {cycle}"));
     }
 
-    let index = fetch_repository_index()?;
+    if let Some(installed) = database::get_installed(target, name)
+        .map_err(|e| format!("Could not check installed package '{name}': {e}"))?
+    {
+        println!(
+            "{name} {} is already installed; skipping.",
+            installed.version
+        );
+
+        return Ok((
+            Package {
+                name: installed.name,
+                version: installed.version,
+                description: installed.description,
+                dependencies: Vec::new(),
+            },
+            false,
+        ));
+    }
 
     let repo_package = index
         .package
         .iter()
         .find(|package| package.name == name)
+        .cloned()
         .ok_or_else(|| format!("Package '{name}' was not found in the repository"))?;
 
-    if !safe_component(&repo_package.version) {
+    if !safe_package_component(&repo_package.version) {
         return Err("Invalid package version in repository index".into());
     }
 
@@ -354,88 +385,168 @@ fn install_repository_package(name: &str) -> Result<(Package, PathBuf), String> 
         return Err("Package URL must use HTTPS".into());
     }
 
-    println!(
-        "Downloading {} {}...",
-        repo_package.name, repo_package.version
-    );
+    visiting.push(name.to_string());
 
-    let response = ureq::get(&repo_package.url)
-        .call()
-        .map_err(|e| format!("Could not download package: {e}"))?;
+    let result = (|| -> Result<(Package, bool), String> {
+        println!(
+            "Downloading {} {}...",
+            repo_package.name, repo_package.version
+        );
 
-    let mut bytes = Vec::new();
+        let response = ureq::get(&repo_package.url)
+            .call()
+            .map_err(|e| format!("Could not download package: {e}"))?;
 
-    response
-        .into_reader()
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("Could not read downloaded package: {e}"))?;
+        let mut bytes = Vec::new();
 
-    let actual_hash = format!("{:x}", Sha256::digest(&bytes));
-    let expected_hash = repo_package.sha256.trim().to_ascii_lowercase();
+        response
+            .into_reader()
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("Could not read downloaded package: {e}"))?;
 
-    if actual_hash != expected_hash {
-        return Err(format!(
-            "SHA-256 mismatch! Expected {}, got {}",
-            expected_hash, actual_hash
+        let actual_hash = format!("{:x}", Sha256::digest(&bytes));
+        let expected_hash = repo_package.sha256.trim().to_ascii_lowercase();
+
+        if actual_hash != expected_hash {
+            return Err(format!(
+                "SHA-256 mismatch! Expected {}, got {}",
+                expected_hash, actual_hash
+            ));
+        }
+
+        println!("Checksum verified.");
+
+        let home = env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "Could not determine your home directory".to_string())?;
+
+        let cache = home.join(".cache/vpk/packages");
+
+        fs::create_dir_all(&cache).map_err(|e| format!("Could not create package cache: {e}"))?;
+
+        let archive_path = cache.join(format!(
+            "{}-{}-{}.vpk",
+            name,
+            repo_package.version,
+            process::id()
         ));
-    }
 
-    println!("Checksum verified.");
+        let mut archive_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&archive_path)
+            .map_err(|e| format!("Could not create temporary package file: {e}"))?;
+
+        let write_result = (|| -> io::Result<()> {
+            use io::Write;
+            archive_file.write_all(&bytes)?;
+            archive_file.flush()
+        })();
+
+        if let Err(error) = write_result {
+            drop(archive_file);
+            let _ = fs::remove_file(&archive_path);
+            return Err(format!("Could not save downloaded package: {error}"));
+        }
+
+        drop(archive_file);
+
+        let package_result = (|| -> Result<(Package, bool), String> {
+            let archive_string = archive_path
+                .to_str()
+                .ok_or_else(|| "Invalid temporary package path".to_string())?;
+
+            let manifest = inspect_package(archive_string)?;
+
+            if manifest.name != repo_package.name || manifest.version != repo_package.version {
+                return Err("Downloaded package manifest does not match repository index".into());
+            }
+
+            // Install dependencies before installing this package.
+            for dependency in &manifest.dependencies {
+                println!("Resolving dependency '{dependency}'...");
+
+                install_repository_package_recursive(dependency, index, target, visiting)?;
+            }
+
+            let target_string = target
+                .to_str()
+                .ok_or_else(|| "Invalid installation path".to_string())?;
+
+            let installed = install_package(archive_string, target_string)?;
+
+            Ok((installed, true))
+        })();
+
+        let _ = fs::remove_file(&archive_path);
+
+        package_result
+    })();
+
+    visiting.pop();
+
+    result
+}
+
+fn install_repository_package(name: &str) -> Result<(Package, PathBuf, bool), String> {
+    let index = fetch_repository_index()?;
 
     let home = env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| "Could not determine your home directory".to_string())?;
 
-    let cache = home.join(".cache/vpk/packages");
+    let target = home.join(".local/share/vpk/root");
 
-    fs::create_dir_all(&cache).map_err(|e| format!("Could not create package cache: {e}"))?;
+    let (package, newly_installed) =
+        install_repository_package_recursive(name, &index, &target, &mut Vec::new())?;
 
-    let archive_path = cache.join(format!(
-        "{}-{}-{}.vpk",
-        name,
-        repo_package.version,
-        process::id()
-    ));
+    Ok((package, target, newly_installed))
+}
 
-    let mut archive_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&archive_path)
-        .map_err(|e| format!("Could not create temporary package file: {e}"))?;
+fn build_dependent_tree(
+    package_name: &str,
+    packages: &[database::InstalledPackage],
+    prefix: &str,
+    ancestors: &mut Vec<String>,
+    output: &mut String,
+) -> usize {
+    let mut dependents: Vec<&database::InstalledPackage> = packages
+        .iter()
+        .filter(|installed| {
+            installed
+                .dependencies
+                .iter()
+                .any(|dependency| dependency == package_name)
+                && !ancestors.contains(&installed.name)
+        })
+        .collect();
 
-    if let Err(error) = (|| -> io::Result<()> {
-        use io::Write;
-        archive_file.write_all(&bytes)?;
-        archive_file.flush()
-    })() {
-        let _ = fs::remove_file(&archive_path);
-        return Err(format!("Could not save downloaded package: {error}"));
+    dependents.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut total = 0;
+
+    for (index, dependent) in dependents.iter().enumerate() {
+        let is_last = index + 1 == dependents.len();
+
+        output.push_str(&format!(
+            "{}{}{} depends on {}\n",
+            prefix,
+            if is_last { "└── " } else { "├── " },
+            dependent.name,
+            package_name
+        ));
+
+        let next_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
+
+        ancestors.push(dependent.name.clone());
+
+        total +=
+            1 + build_dependent_tree(&dependent.name, packages, &next_prefix, ancestors, output);
+
+        ancestors.pop();
     }
 
-    let result = (|| -> Result<(Package, PathBuf), String> {
-        let archive_string = archive_path
-            .to_str()
-            .ok_or_else(|| "Invalid temporary package path".to_string())?;
-
-        let manifest = inspect_package(archive_string)?;
-
-        if manifest.name != repo_package.name || manifest.version != repo_package.version {
-            return Err("Downloaded package manifest does not match repository index".into());
-        }
-
-        let target = home.join(".local/share/vpk/root");
-        let target_string = target
-            .to_str()
-            .ok_or_else(|| "Invalid installation path".to_string())?;
-
-        let installed = install_package(archive_string, target_string)?;
-
-        Ok((installed, target))
-    })();
-
-    let _ = fs::remove_file(&archive_path);
-
-    result
+    total
 }
 
 fn main() {
@@ -530,6 +641,37 @@ fn main() {
             println!("Package: {}", package.name);
             println!("Version: {}", package.version);
             println!("Description: {}", package.description);
+
+            let installed_packages = match database::list_installed(&root) {
+                Ok(packages) => packages,
+                Err(error) => {
+                    eprintln!("vpk: could not check package dependencies: {error}");
+                    process::exit(1);
+                }
+            };
+
+            let mut tree = String::new();
+
+            let affected = build_dependent_tree(
+                &package.name,
+                &installed_packages,
+                "  ",
+                &mut vec![package.name.clone()],
+                &mut tree,
+            );
+
+            if !tree.is_empty() {
+                println!("{} (being removed)", package.name);
+                print!("{tree}");
+            }
+
+            if affected > 0 {
+                println!();
+                println!(
+                    "WARNING: Removing '{}' may affect {affected} installed package(s):",
+                    package.name
+                );
+            }
             println!();
             println!("The following files will be removed:");
 
@@ -708,11 +850,16 @@ fn main() {
                 let name = &args[2];
 
                 match install_repository_package(name) {
-                    Ok((package, target)) => {
-                        println!(
-                            "Installed {} {} successfully!",
-                            package.name, package.version
-                        );
+                    Ok((package, target, newly_installed)) => {
+                        if newly_installed {
+                            println!(
+                                "Installed {} {} successfully!",
+                                package.name, package.version
+                            );
+                        } else {
+                            println!("{} {} is already installed.", package.name, package.version);
+                        }
+
                         println!("Location: {}", target.display());
                     }
                     Err(error) => {
@@ -1020,5 +1167,129 @@ description = "Rollback test"
         );
 
         fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn detects_circular_dependencies() {
+        let index = RepoIndex { package: vec![] };
+        let target = env::temp_dir().join(format!("vpk-test-cycle-{}", std::process::id()));
+
+        let mut visiting = vec!["hello".to_string()];
+
+        let result = install_repository_package_recursive("hello", &index, &target, &mut visiting);
+
+        let error = match result {
+            Ok(_) => panic!("Expected the resolver to return an error"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("Circular dependency detected"));
+        assert!(error.contains("hello -> hello"));
+    }
+
+    #[test]
+    fn reports_missing_repository_package() {
+        let index = RepoIndex { package: vec![] };
+        let target = env::temp_dir().join(format!("vpk-test-missing-{}", std::process::id()));
+
+        let mut visiting = Vec::new();
+
+        let result = install_repository_package_recursive(
+            "nonexistent-package",
+            &index,
+            &target,
+            &mut visiting,
+        );
+
+        let error = match result {
+            Ok(_) => panic!("Expected the resolver to return an error"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("was not found in the repository"));
+    }
+
+    #[test]
+    fn finds_transitive_dependents_in_a_branching_tree() {
+        let packages = vec![
+            database::InstalledPackage {
+                name: "A".into(),
+                version: "1.0".into(),
+                description: "A depends on B".into(),
+                files: vec![],
+                dependencies: vec!["B".into()],
+            },
+            database::InstalledPackage {
+                name: "C".into(),
+                version: "1.0".into(),
+                description: "C depends on A".into(),
+                files: vec![],
+                dependencies: vec!["A".into()],
+            },
+            database::InstalledPackage {
+                name: "D".into(),
+                version: "1.0".into(),
+                description: "D depends on A".into(),
+                files: vec![],
+                dependencies: vec!["A".into()],
+            },
+            database::InstalledPackage {
+                name: "E".into(),
+                version: "1.0".into(),
+                description: "E depends on D".into(),
+                files: vec![],
+                dependencies: vec!["D".into()],
+            },
+            database::InstalledPackage {
+                name: "F".into(),
+                version: "1.0".into(),
+                description: "F depends on B".into(),
+                files: vec![],
+                dependencies: vec!["B".into()],
+            },
+        ];
+
+        let mut tree = String::new();
+
+        let affected = build_dependent_tree("B", &packages, "", &mut vec!["B".into()], &mut tree);
+
+        assert_eq!(affected, 5);
+        assert_eq!(
+            tree,
+            concat!(
+                "├── A depends on B\n",
+                "│   ├── C depends on A\n",
+                "│   └── D depends on A\n",
+                "│       └── E depends on D\n",
+                "└── F depends on B\n",
+            )
+        );
+    }
+
+    #[test]
+    fn handles_cycles_in_dependent_tree() {
+        let packages = vec![
+            database::InstalledPackage {
+                name: "A".into(),
+                version: "1.0".into(),
+                description: "A depends on B".into(),
+                files: vec![],
+                dependencies: vec!["B".into()],
+            },
+            database::InstalledPackage {
+                name: "B".into(),
+                version: "1.0".into(),
+                description: "B depends on A".into(),
+                files: vec![],
+                dependencies: vec!["A".into()],
+            },
+        ];
+
+        let mut tree = String::new();
+
+        let affected = build_dependent_tree("B", &packages, "", &mut vec!["B".into()], &mut tree);
+
+        assert_eq!(affected, 1);
+        assert_eq!(tree, "└── A depends on B\n");
     }
 }

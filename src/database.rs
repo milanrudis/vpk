@@ -12,6 +12,8 @@ pub struct InstalledPackage {
     pub version: String,
     pub description: String,
     pub files: Vec<String>,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
 }
 
 fn database_directory(root: &Path) -> PathBuf {
@@ -283,6 +285,7 @@ mod tests {
             version: "1.0.0".into(),
             description: "Original package".into(),
             files: vec!["usr/bin/original".into()],
+            dependencies: vec![],
         };
 
         record_install(&root, original).unwrap();
@@ -292,6 +295,7 @@ mod tests {
             version: "2.0.0".into(),
             description: "Replacement package".into(),
             files: vec!["usr/bin/replacement".into()],
+            dependencies: vec![],
         };
 
         let result = record_install(&root, duplicate);
