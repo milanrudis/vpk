@@ -310,7 +310,17 @@ fn install_package(package_path: &str, target: &str) -> Result<Package, String> 
     Ok(package)
 }
 
-fn fetch_repository_index() -> Result<RepoIndex, String> {
+fn repository_index_path() -> Result<PathBuf, String> {
+    let home =
+        env::var_os("HOME").ok_or_else(|| "HOME environment variable is not set".to_string())?;
+
+    Ok(PathBuf::from(home)
+        .join(".cache")
+        .join("vpk")
+        .join("index.toml"))
+}
+
+fn update_repository_index() -> Result<RepoIndex, String> {
     let response = ureq::get(REPO_INDEX_URL)
         .call()
         .map_err(|e| format!("could not fetch repository index: {e}"))?;
@@ -322,7 +332,44 @@ fn fetch_repository_index() -> Result<RepoIndex, String> {
         .read_to_string(&mut contents)
         .map_err(|e| format!("could not read repository index: {e}"))?;
 
-    toml::from_str(&contents).map_err(|e| format!("could not parse repository index: {e}"))
+    // Validate the new index before touching the existing cache.
+    let index: RepoIndex =
+        toml::from_str(&contents).map_err(|e| format!("could not parse repository index: {e}"))?;
+
+    let path = repository_index_path()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "invalid repository cache path".to_string())?;
+
+    fs::create_dir_all(parent).map_err(|e| format!("could not create repository cache: {e}"))?;
+
+    // Write to a temporary file, then atomically replace the cached index.
+    let temp_path = path.with_extension(format!("toml.tmp.{}", process::id()));
+
+    fs::write(&temp_path, contents)
+        .map_err(|e| format!("could not write temporary repository index: {e}"))?;
+
+    if let Err(error) = fs::rename(&temp_path, &path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("could not save repository index: {error}"));
+    }
+
+    Ok(index)
+}
+
+fn fetch_repository_index() -> Result<RepoIndex, String> {
+    let path = repository_index_path()?;
+
+    if path.is_file() {
+        let contents = fs::read_to_string(&path)
+            .map_err(|e| format!("could not read cached repository index: {e}"))?;
+
+        return toml::from_str(&contents)
+            .map_err(|e| format!("could not parse cached repository index: {e}"));
+    }
+
+    // First use: fetch and cache the repository index automatically.
+    update_repository_index()
 }
 
 fn safe_package_component(value: &str) -> bool {
@@ -559,6 +606,29 @@ fn main() {
     }
 
     match args[1].as_str() {
+        "update" => {
+            if args.len() != 2 {
+                eprintln!("Usage: vpk update");
+                process::exit(1);
+            }
+
+            match update_repository_index() {
+                Ok(index) => {
+                    println!(
+                        "Repository index updated successfully! {} package(s) available.",
+                        index.package.len()
+                    );
+                    if let Ok(path) = repository_index_path() {
+                        println!("Saved to: {}", path.display());
+                    }
+                }
+                Err(error) => {
+                    eprintln!("vpk: could not update repository: {error}");
+                    process::exit(1);
+                }
+            }
+        }
+
         "search" => {
             if args.len() != 3 {
                 eprintln!("Usage: vpk search <query>");
@@ -900,6 +970,7 @@ fn main() {
             println!("  vpk <command> [arguments]");
             println!();
             println!("Commands:");
+            println!("  update                         Refresh the repository index");
             println!("  search <query>                 Search available packages");
             println!("  install <package-name>         Install a package from the repository");
             println!("  install <package.vpk> <dir>     Install a local package archive");
