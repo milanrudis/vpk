@@ -1016,8 +1016,36 @@ fn install_package(package_path: &str, target: &str) -> Result<Package, String> 
                 // can be rolled back.
                 created_files.push(destination.clone());
 
+                #[cfg(unix)]
+                let file_mode = entry
+                    .header()
+                    .mode()
+                    .map_err(|e| {
+                        format!(
+                            "Could not read permissions for '{}': {e}",
+                            relative.display()
+                        )
+                    })?
+                    & 0o777;
+
                 io::copy(&mut entry, &mut output)
                     .map_err(|e| format!("Could not write '{}': {e}", destination.display()))?;
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+
+                    fs::set_permissions(
+                        &destination,
+                        fs::Permissions::from_mode(file_mode),
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "Could not set permissions for '{}': {e}",
+                            destination.display()
+                        )
+                    })?;
+                }
 
                 installed_files.push(relative.to_string_lossy().into_owned());
             } else {
@@ -3201,6 +3229,42 @@ description = "A test package"
             fs::read_to_string(target.join("usr/share/hello.txt")).unwrap(),
             "Hello from VPK tests!"
         );
+
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+        #[cfg(unix)]
+    #[test]
+    fn preserves_executable_permissions_when_installing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = env::temp_dir().join(format!(
+            "vpk-test-executable-permissions-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+
+        let package_dir = create_test_package(&temp);
+        let executable = package_dir.join("data/usr/bin/vpk-test-executable");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, "#!/bin/sh\necho executable\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let archive_path = temp.join("test-package.vpk");
+        let target = temp.join("install-root");
+
+        pack_package(
+            package_dir.to_str().unwrap(),
+            archive_path.to_str().unwrap(),
+        )
+        .unwrap();
+
+        install_package(archive_path.to_str().unwrap(), target.to_str().unwrap()).unwrap();
+
+        let installed = target.join("usr/bin/vpk-test-executable");
+        let mode = fs::metadata(&installed).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "executable permissions were not preserved");
 
         fs::remove_dir_all(&temp).unwrap();
     }
