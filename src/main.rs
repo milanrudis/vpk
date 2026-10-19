@@ -19,6 +19,17 @@ struct RepoPackage {
     url: String,
     sha256: String,
 }
+
+fn is_newer_version(installed: &str, available: &str) -> Result<bool, String> {
+    let installed_version = semver::Version::parse(installed)
+        .map_err(|e| format!("Invalid installed version '{installed}': {e}"))?;
+
+    let available_version = semver::Version::parse(available)
+        .map_err(|e| format!("Invalid repository version '{available}': {e}"))?;
+
+    Ok(available_version > installed_version)
+}
+
 use std::{
     env,
     fs::{self, File, OpenOptions},
@@ -134,6 +145,286 @@ fn package_data_path(path: &Path) -> Result<PathBuf, String> {
     Ok(relative)
 }
 
+fn validate_package_archive(
+    archive_path: &Path,
+    expected_name: &str,
+    expected_version: &str,
+) -> Result<Package, String> {
+    use std::collections::HashMap;
+
+    let file =
+        File::open(archive_path).map_err(|e| format!("Could not open package archive: {e}"))?;
+    let decoder = zstd::Decoder::new(file)
+        .map_err(|e| format!("Could not decompress package archive: {e}"))?;
+    let mut archive = Archive::new(decoder);
+
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("Could not read package archive: {e}"))?;
+
+    let mut manifest: Option<Package> = None;
+    let mut paths: HashMap<PathBuf, bool> = HashMap::new();
+
+    for entry_result in entries {
+        let mut entry = entry_result.map_err(|e| format!("Invalid archive entry: {e}"))?;
+
+        let path = entry
+            .path()
+            .map_err(|e| format!("Invalid archive path: {e}"))?
+            .into_owned();
+
+        let entry_type = entry.header().entry_type();
+
+        if path == Path::new("manifest.toml") {
+            if manifest.is_some() {
+                return Err("Package contains multiple manifests".into());
+            }
+
+            if !entry_type.is_file() {
+                return Err("Package manifest must be a regular file".into());
+            }
+
+            let mut contents = String::new();
+            entry
+                .read_to_string(&mut contents)
+                .map_err(|e| format!("Could not read package manifest: {e}"))?;
+
+            let parsed: Package =
+                toml::from_str(&contents).map_err(|e| format!("Invalid package manifest: {e}"))?;
+
+            if parsed.name != expected_name || parsed.version != expected_version {
+                return Err("Package manifest does not match the expected name and version".into());
+            }
+
+            if !safe_package_component(&parsed.name) || !safe_package_component(&parsed.version) {
+                return Err("Package manifest contains an invalid name or version".into());
+            }
+
+            manifest = Some(parsed);
+            continue;
+        }
+
+        let is_file = entry_type.is_file();
+        let is_dir = entry_type.is_dir();
+
+        if !is_file && !is_dir {
+            return Err(format!(
+                "Unsupported entry type in package: {}",
+                path.display()
+            ));
+        }
+
+        let relative = package_data_path(&path)?;
+
+        if relative.as_os_str().is_empty() {
+            if is_file {
+                return Err("Package contains a file named 'data'".into());
+            }
+            continue;
+        }
+
+        if paths.contains_key(&relative) {
+            return Err(format!(
+                "Package contains a duplicate path: {}",
+                path.display()
+            ));
+        }
+
+        // No parent component may be a file.
+        let mut parent = relative.parent();
+        while let Some(parent_path) = parent {
+            if paths.get(parent_path) == Some(&true) {
+                return Err(format!(
+                    "Package path conflicts with a file: {}",
+                    path.display()
+                ));
+            }
+            parent = parent_path.parent();
+        }
+
+        // A new file cannot replace a directory already declared.
+        if is_file && paths.keys().any(|existing| existing.starts_with(&relative)) {
+            return Err(format!(
+                "Package file conflicts with an existing directory: {}",
+                path.display()
+            ));
+        }
+
+        paths.insert(relative, is_file);
+    }
+
+    manifest.ok_or_else(|| "Package archive is missing manifest.toml".into())
+}
+
+fn package_archive_files(archive_path: &Path) -> Result<Vec<String>, String> {
+    let file =
+        File::open(archive_path).map_err(|e| format!("Could not open package archive: {e}"))?;
+
+    let decoder = zstd::Decoder::new(file)
+        .map_err(|e| format!("Could not decompress package archive: {e}"))?;
+
+    let mut archive = Archive::new(decoder);
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("Could not read package archive: {e}"))?;
+
+    let mut files = Vec::new();
+
+    for entry_result in entries {
+        let entry = entry_result.map_err(|e| format!("Invalid archive entry: {e}"))?;
+
+        let path = entry
+            .path()
+            .map_err(|e| format!("Invalid archive path: {e}"))?
+            .into_owned();
+
+        if path == Path::new("manifest.toml") || entry.header().entry_type().is_dir() {
+            continue;
+        }
+
+        if !entry.header().entry_type().is_file() {
+            return Err(format!(
+                "Unsupported archive entry type: {}",
+                path.display()
+            ));
+        }
+
+        let relative = package_data_path(&path)?;
+
+        if relative.as_os_str().is_empty() {
+            return Err("Package contains a file named 'data'".into());
+        }
+
+        files.push(relative.to_string_lossy().into_owned());
+    }
+
+    files.sort();
+    Ok(files)
+}
+
+struct StagedPackageDirectory {
+    path: PathBuf,
+}
+
+impl Drop for StagedPackageDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn create_staging_directory() -> Result<StagedPackageDirectory, String> {
+    let base = env::temp_dir();
+
+    for attempt in 0..100 {
+        let path = base.join(format!("vpk-stage-{}-{attempt}", process::id()));
+
+        let mut builder = fs::DirBuilder::new();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+
+        match builder.create(&path) {
+            Ok(()) => return Ok(StagedPackageDirectory { path }),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!("Could not create staging directory: {error}"));
+            }
+        }
+    }
+
+    Err("Could not find an available staging directory name".into())
+}
+
+fn stage_package_archive(
+    archive_path: &Path,
+    expected_name: &str,
+    expected_version: &str,
+) -> Result<(StagedPackageDirectory, Vec<String>), String> {
+    validate_package_archive(archive_path, expected_name, expected_version)?;
+
+    let staged = create_staging_directory()?;
+    let mut created_dirs: Vec<PathBuf> = Vec::new();
+    let mut staged_files: Vec<String> = Vec::new();
+
+    let result = (|| -> Result<(), String> {
+        let file =
+            File::open(archive_path).map_err(|e| format!("Could not open package archive: {e}"))?;
+        let decoder = zstd::Decoder::new(file)
+            .map_err(|e| format!("Could not decompress package archive: {e}"))?;
+        let mut archive = Archive::new(decoder);
+
+        let entries = archive
+            .entries()
+            .map_err(|e| format!("Could not read package archive: {e}"))?;
+
+        for entry_result in entries {
+            let mut entry =
+                entry_result.map_err(|e| format!("Could not read archive entry: {e}"))?;
+
+            let archive_path = entry
+                .path()
+                .map_err(|e| format!("Invalid archive path: {e}"))?
+                .into_owned();
+
+            if archive_path == Path::new("manifest.toml") {
+                continue;
+            }
+
+            let relative = package_data_path(&archive_path)?;
+            let is_directory = entry.header().entry_type().is_dir();
+            let is_file = entry.header().entry_type().is_file();
+
+            if relative.as_os_str().is_empty() {
+                if is_directory {
+                    continue;
+                }
+                return Err("Package contains a file named 'data'".into());
+            }
+
+            if is_directory {
+                ensure_directory(&staged.path, &relative, &mut created_dirs)
+                    .map_err(|e| format!("Could not stage directory: {e}"))?;
+            } else if is_file {
+                let parent = relative.parent().unwrap_or(Path::new(""));
+
+                ensure_directory(&staged.path, parent, &mut created_dirs)
+                    .map_err(|e| format!("Could not prepare staging directory: {e}"))?;
+
+                let destination = staged.path.join(&relative);
+
+                let mut output = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&destination)
+                    .map_err(|e| format!("Could not create staged file: {e}"))?;
+
+                io::copy(&mut entry, &mut output)
+                    .map_err(|e| format!("Could not write staged file: {e}"))?;
+
+                staged_files.push(relative.to_string_lossy().into_owned());
+            } else {
+                return Err(format!(
+                    "Unsupported archive entry type: {}",
+                    archive_path.display()
+                ));
+            }
+        }
+
+        staged_files.sort();
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        // The directory guard removes all partial extraction on return.
+        return Err(error);
+    }
+
+    Ok((staged, staged_files))
+}
+
 fn ensure_directory(
     root: &Path,
     relative: &Path,
@@ -175,6 +466,481 @@ fn ensure_directory(
     }
 
     Ok(())
+}
+
+fn install_staged_file(
+    staging_root: &Path,
+    root: &Path,
+    relative: &Path,
+    created_files: &mut Vec<PathBuf>,
+    created_dirs: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let safe_path = package_data_path(&PathBuf::from("data").join(relative))?;
+
+    if safe_path != relative {
+        return Err(format!("Unsafe staged file path: {}", relative.display()));
+    }
+
+    let source = staging_root.join(&safe_path);
+    let source_metadata =
+        fs::symlink_metadata(&source).map_err(|e| format!("Could not inspect staged file: {e}"))?;
+
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+        return Err(format!(
+            "Staged source is not a regular file: {}",
+            source.display()
+        ));
+    }
+
+    if check_upgrade_path(root, relative)? {
+        return Err(format!(
+            "Refusing to overwrite existing file: {}",
+            relative.display()
+        ));
+    }
+
+    let parent = safe_path.parent().unwrap_or(Path::new(""));
+    ensure_directory(root, parent, created_dirs)
+        .map_err(|e| format!("Could not prepare upgrade destination: {e}"))?;
+
+    let destination = root.join(&safe_path);
+
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+        .map_err(|e| format!("Could not create upgrade destination: {e}"))?;
+
+    created_files.push(destination.clone());
+
+    let mut input = File::open(&source).map_err(|e| format!("Could not open staged file: {e}"))?;
+
+    io::copy(&mut input, &mut output)
+        .map_err(|e| format!("Could not write upgrade destination: {e}"))?;
+
+    output
+        .sync_all()
+        .map_err(|e| format!("Could not sync upgrade destination: {e}"))?;
+
+    Ok(())
+}
+
+fn check_upgrade_path(root: &Path, relative: &Path) -> Result<bool, String> {
+    let root_metadata =
+        fs::symlink_metadata(root).map_err(|e| format!("Could not inspect install root: {e}"))?;
+
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err("Install root is not a safe directory".into());
+    }
+    let mut current = root.to_path_buf();
+    let mut components = relative.components().peekable();
+
+    while let Some(component) = components.next() {
+        let name = match component {
+            Component::Normal(name) => name,
+            _ => return Err(format!("Unsafe upgrade path: {}", relative.display())),
+        };
+
+        current.push(name);
+
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "Upgrade path contains a symlink: {}",
+                    current.display()
+                ));
+            }
+            Ok(metadata) if components.peek().is_some() && !metadata.is_dir() => {
+                return Err(format!(
+                    "Upgrade parent is not a directory: {}",
+                    current.display()
+                ));
+            }
+            Ok(metadata) if components.peek().is_none() && !metadata.is_file() => {
+                return Err(format!(
+                    "Upgrade destination is not a regular file: {}",
+                    current.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Could not inspect upgrade path '{}': {error}",
+                    current.display()
+                ));
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+fn preflight_upgrade_files(
+    root: &Path,
+    package_name: &str,
+    files: &[String],
+) -> Result<(), String> {
+    for file in files {
+        let relative = Path::new(file);
+
+        // Revalidate the relative path before checking the filesystem.
+        let safe_path = package_data_path(&PathBuf::from("data").join(relative))?;
+
+        if safe_path.to_string_lossy() != *file {
+            return Err(format!("Unsafe upgrade path: {file}"));
+        }
+
+        if database::other_package_owns_file(root, package_name, file)
+            .map_err(|e| format!("Could not check file ownership: {e}"))?
+        {
+            return Err(format!(
+                "Cannot upgrade '{package_name}': file '{file}' is claimed by another package"
+            ));
+        }
+
+        check_upgrade_path(root, relative)?;
+    }
+
+    Ok(())
+}
+
+fn obsolete_package_files(old_files: &[String], new_files: &[String]) -> Vec<String> {
+    let mut obsolete: Vec<String> = old_files
+        .iter()
+        .filter(|old_file| !new_files.contains(old_file))
+        .cloned()
+        .collect();
+
+    obsolete.sort();
+    obsolete
+}
+
+fn upgrade_files_to_backup(old_files: &[String]) -> Vec<String> {
+    let mut files = old_files.to_vec();
+    files.sort();
+    files.dedup();
+    files
+}
+
+#[cfg(unix)]
+fn same_filesystem(first: &Path, second: &Path) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let first_metadata =
+        fs::metadata(first).map_err(|e| format!("Could not inspect '{}': {e}", first.display()))?;
+
+    let second_metadata = fs::metadata(second)
+        .map_err(|e| format!("Could not inspect '{}': {e}", second.display()))?;
+
+    Ok(first_metadata.dev() == second_metadata.dev())
+}
+
+fn create_upgrade_backup_dir(root: &Path) -> Result<PathBuf, String> {
+    let parent = root
+        .parent()
+        .ok_or_else(|| "Install root has no parent directory".to_string())?;
+
+    let parent_metadata = fs::symlink_metadata(parent)
+        .map_err(|e| format!("Could not inspect install root parent: {e}"))?;
+
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err("Install root parent is not a safe directory".into());
+    }
+
+    let backup_root = parent.join("vpk-upgrade-backups");
+
+    if !same_filesystem(root, parent)? {
+        return Err("Install root and upgrade backups must be on the same filesystem".into());
+    }
+
+    match fs::symlink_metadata(&backup_root) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err("Upgrade backup path is not a safe directory".into());
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+
+            builder
+                .create(&backup_root)
+                .map_err(|e| format!("Could not create upgrade backup directory: {e}"))?;
+        }
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect upgrade backup directory: {error}"
+            ));
+        }
+    }
+
+    if !same_filesystem(root, &backup_root)? {
+        return Err("Install root and upgrade backups must be on the same filesystem".into());
+    }
+
+    for attempt in 0..100 {
+        let backup_dir = backup_root.join(format!("backup-{}-{attempt}", std::process::id()));
+
+        let mut builder = fs::DirBuilder::new();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+
+        match builder.create(&backup_dir) {
+            Ok(()) => return Ok(backup_dir),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!("Could not create unique upgrade backup: {error}"));
+            }
+        }
+    }
+
+    Err("Could not create a unique upgrade backup directory after 100 attempts".into())
+}
+
+fn backup_upgrade_file(root: &Path, backup_dir: &Path, relative: &Path) -> Result<(), String> {
+    if !check_upgrade_path(root, relative)? {
+        return Err(format!(
+            "Cannot back up missing file: {}",
+            relative.display()
+        ));
+    }
+
+    let backup_metadata = fs::symlink_metadata(backup_dir)
+        .map_err(|e| format!("Could not inspect backup directory: {e}"))?;
+
+    if backup_metadata.file_type().is_symlink() || !backup_metadata.is_dir() {
+        return Err("Backup destination is not a safe directory".into());
+    }
+
+    let mut backup = backup_dir.to_path_buf();
+
+    for component in relative.components() {
+        let name = match component {
+            Component::Normal(name) => name,
+            _ => return Err(format!("Unsafe backup path: {}", relative.display())),
+        };
+
+        backup.push(name);
+    }
+
+    let mut current = backup_dir.to_path_buf();
+
+    for component in relative.parent().unwrap_or(Path::new("")).components() {
+        let name = match component {
+            Component::Normal(name) => name,
+            _ => return Err(format!("Unsafe backup path: {}", relative.display())),
+        };
+
+        current.push(name);
+
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(format!("Unsafe backup directory: {}", current.display()));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&current).map_err(|e| {
+                    format!(
+                        "Could not create backup subdirectory '{}': {e}",
+                        current.display()
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Could not inspect backup subdirectory '{}': {error}",
+                    current.display()
+                ));
+            }
+        }
+    }
+
+    match fs::symlink_metadata(&backup) {
+        Ok(_) => return Err(format!("Backup already exists: {}", backup.display())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect backup destination '{}': {error}",
+                backup.display()
+            ));
+        }
+    }
+
+    fs::rename(root.join(relative), &backup)
+        .map_err(|e| format!("Could not back up '{}': {e}", relative.display()))?;
+
+    Ok(())
+}
+
+fn backup_existing_package_files(
+    root: &Path,
+    backup_dir: &Path,
+    package_name: &str,
+    old_files: &[String],
+) -> Result<Vec<String>, String> {
+    let mut backed_up: Vec<String> = Vec::new();
+
+    let result = (|| -> Result<(), String> {
+        for file in upgrade_files_to_backup(old_files) {
+            let relative = Path::new(&file);
+
+            let safe_path = package_data_path(&PathBuf::from("data").join(relative))?;
+            if safe_path.to_string_lossy() != file {
+                return Err(format!("Unsafe upgrade path: {file}"));
+            }
+
+            if database::other_package_owns_file(root, package_name, &file)
+                .map_err(|e| format!("Could not check file ownership: {e}"))?
+            {
+                return Err(format!(
+                    "Cannot upgrade '{package_name}': file '{file}' is claimed by another package"
+                ));
+            }
+
+            if !check_upgrade_path(root, relative)? {
+                continue;
+            }
+
+            backup_upgrade_file(root, backup_dir, relative)?;
+            backed_up.push(file);
+        }
+
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        let mut rollback_errors = Vec::new();
+
+        for file in backed_up.iter().rev() {
+            if let Err(restore_error) = restore_upgrade_file(root, backup_dir, Path::new(file)) {
+                rollback_errors.push(format!("'{file}': {restore_error}"));
+            }
+        }
+
+        if rollback_errors.is_empty() {
+            return Err(error);
+        }
+
+        return Err(format!(
+            "{error}; rollback failures: {}; remaining backup files may be in '{}'",
+            rollback_errors.join("; "),
+            backup_dir.display()
+        ));
+    }
+
+    Ok(backed_up)
+}
+
+fn check_existing_parent_directories(base: &Path, relative: &Path) -> Result<(), String> {
+    let mut current = base.to_path_buf();
+    let mut components = relative.components().peekable();
+
+    while let Some(component) = components.next() {
+        let name = match component {
+            Component::Normal(name) => name,
+            _ => return Err(format!("Unsafe relative path: {}", relative.display())),
+        };
+
+        current.push(name);
+
+        // The last component is the file, not a parent directory.
+        if components.peek().is_none() {
+            break;
+        }
+
+        let metadata = fs::symlink_metadata(&current).map_err(|e| {
+            format!(
+                "Could not inspect parent directory '{}': {e}",
+                current.display()
+            )
+        })?;
+
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(format!("Unsafe parent directory: {}", current.display()));
+        }
+    }
+
+    Ok(())
+}
+
+fn restore_upgrade_file(root: &Path, backup_dir: &Path, relative: &Path) -> Result<(), String> {
+    let safe_path = package_data_path(&PathBuf::from("data").join(relative))?;
+
+    if safe_path != relative {
+        return Err(format!("Unsafe restore path: {}", relative.display()));
+    }
+
+    let destination = root.join(&safe_path);
+    let backup = backup_dir.join(&safe_path);
+
+    if check_upgrade_path(root, relative)? {
+        return Err(format!(
+            "Cannot restore over an existing file: {}",
+            relative.display()
+        ));
+    }
+
+    check_existing_parent_directories(backup_dir, &safe_path)?;
+
+    let backup_metadata =
+        fs::symlink_metadata(&backup).map_err(|e| format!("Could not inspect backup file: {e}"))?;
+
+    if backup_metadata.file_type().is_symlink() || !backup_metadata.is_file() {
+        return Err(format!(
+            "Backup is not a safe regular file: {}",
+            backup.display()
+        ));
+    }
+
+    check_existing_parent_directories(root, &safe_path)?;
+    check_upgrade_path(root, relative)?;
+
+    fs::rename(&backup, &destination)
+        .map_err(|e| format!("Could not restore '{}': {e}", relative.display()))?;
+
+    Ok(())
+}
+
+fn rollback_installed_files(created_files: &[PathBuf], created_dirs: &[PathBuf]) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    for path in created_files.iter().rev() {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => errors.push(format!(
+                "Could not remove newly installed file '{}': {error}",
+                path.display()
+            )),
+        }
+    }
+
+    for path in created_dirs.iter().rev() {
+        match fs::remove_dir(path) {
+            Ok(()) => {}
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+            Err(error) => errors.push(format!(
+                "Could not remove newly created directory '{}': {error}",
+                path.display()
+            )),
+        }
+    }
+
+    errors
 }
 
 fn install_package(package_path: &str, target: &str) -> Result<Package, String> {
@@ -535,6 +1301,89 @@ fn install_repository_package_recursive(
     result
 }
 
+fn download_verified_package(repo_package: &RepoPackage) -> Result<(Package, PathBuf), String> {
+    if !safe_package_component(&repo_package.name) || !safe_package_component(&repo_package.version)
+    {
+        return Err("Invalid package name or version in repository index".into());
+    }
+
+    if !repo_package.url.starts_with("https://") {
+        return Err("Package URL must use HTTPS".into());
+    }
+
+    println!(
+        "Downloading {} {}...",
+        repo_package.name, repo_package.version
+    );
+
+    let response = ureq::get(&repo_package.url)
+        .call()
+        .map_err(|e| format!("Could not download package: {e}"))?;
+
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("Could not read downloaded package: {e}"))?;
+
+    let actual_hash = format!("{:x}", Sha256::digest(&bytes));
+    let expected_hash = repo_package.sha256.trim().to_ascii_lowercase();
+
+    if actual_hash != expected_hash {
+        return Err(format!(
+            "SHA-256 mismatch! Expected {}, got {}",
+            expected_hash, actual_hash
+        ));
+    }
+
+    println!("Checksum verified.");
+
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "Could not determine your home directory".to_string())?;
+
+    let cache = home.join(".cache/vpk/packages");
+    fs::create_dir_all(&cache).map_err(|e| format!("Could not create package cache: {e}"))?;
+
+    let archive_path = cache.join(format!(
+        "{}-{}-{}-upgrade.vpk",
+        repo_package.name,
+        repo_package.version,
+        process::id()
+    ));
+
+    let mut archive_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&archive_path)
+        .map_err(|e| format!("Could not create temporary package file: {e}"))?;
+
+    use io::Write;
+    if let Err(error) = archive_file.write_all(&bytes) {
+        drop(archive_file);
+        let _ = fs::remove_file(&archive_path);
+        return Err(format!("Could not save downloaded package: {error}"));
+    }
+
+    if let Err(error) = archive_file.flush() {
+        drop(archive_file);
+        let _ = fs::remove_file(&archive_path);
+        return Err(format!("Could not save downloaded package: {error}"));
+    }
+    drop(archive_file);
+
+    let manifest =
+        match validate_package_archive(&archive_path, &repo_package.name, &repo_package.version) {
+            Ok(package) => package,
+            Err(error) => {
+                let _ = fs::remove_file(&archive_path);
+                return Err(error);
+            }
+        };
+
+    Ok((manifest, archive_path))
+}
+
 fn install_repository_package(name: &str) -> Result<(Package, PathBuf, bool), String> {
     let index = fetch_repository_index()?;
 
@@ -594,6 +1443,372 @@ fn build_dependent_tree(
     }
 
     total
+}
+
+struct StagedUpgradeArchives(Vec<PathBuf>);
+
+impl Drop for StagedUpgradeArchives {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+struct StagedUpgrade {
+    old_package: InstalledPackage,
+    new_package: Package,
+    archive_path: PathBuf,
+    new_files: Vec<String>,
+}
+
+struct AppliedUpgrade {
+    old_package: InstalledPackage,
+    backup_dir: PathBuf,
+    backed_up_files: Vec<String>,
+    created_files: Vec<PathBuf>,
+    created_dirs: Vec<PathBuf>,
+}
+
+fn upgraded_install_record(upgrade: &StagedUpgrade) -> InstalledPackage {
+    InstalledPackage {
+        name: upgrade.new_package.name.clone(),
+        version: upgrade.new_package.version.clone(),
+        description: upgrade.new_package.description.clone(),
+        files: upgrade.new_files.clone(),
+        dependencies: upgrade.new_package.dependencies.clone(),
+    }
+}
+
+fn rollback_upgrade(
+    root: &Path,
+    backup_dir: &Path,
+    backed_up_files: &[String],
+    created_files: &[PathBuf],
+    created_dirs: &[PathBuf],
+) -> Vec<String> {
+    let mut errors = rollback_installed_files(created_files, created_dirs);
+
+    for file in backed_up_files.iter().rev() {
+        if let Err(error) = restore_upgrade_file(root, backup_dir, Path::new(file)) {
+            errors.push(format!("Could not restore '{file}': {error}"));
+        }
+    }
+
+    errors
+}
+
+fn apply_single_upgrade(
+    root: &Path,
+    upgrade: &StagedUpgrade,
+    staging_root: &Path,
+    staged_files: &[String],
+) -> Result<AppliedUpgrade, String> {
+    if staged_files != upgrade.new_files {
+        return Err(format!(
+            "Staged file list changed unexpectedly for '{}'",
+            upgrade.new_package.name
+        ));
+    }
+
+    preflight_upgrade_files(root, &upgrade.old_package.name, staged_files)?;
+
+    let backup_dir = create_upgrade_backup_dir(root)?;
+    let old_package = upgrade.old_package.clone();
+
+    let backed_up_files = backup_existing_package_files(
+        root,
+        &backup_dir,
+        &upgrade.old_package.name,
+        &upgrade.old_package.files,
+    )?;
+
+    let mut created_files = Vec::new();
+    let mut created_dirs = Vec::new();
+
+    let result = (|| -> Result<(), String> {
+        for file in staged_files {
+            install_staged_file(
+                staging_root,
+                root,
+                Path::new(file),
+                &mut created_files,
+                &mut created_dirs,
+            )?;
+        }
+
+        database::replace_install_record(root, upgraded_install_record(upgrade))
+            .map_err(|e| format!("Could not update installed package record: {e}"))?;
+
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        let rollback_errors = rollback_upgrade(
+            root,
+            &backup_dir,
+            &backed_up_files,
+            &created_files,
+            &created_dirs,
+        );
+
+        if rollback_errors.is_empty() {
+            return Err(error);
+        }
+
+        return Err(format!(
+            "{error}; rollback failures: {}",
+            rollback_errors.join("; ")
+        ));
+    }
+
+    Ok(AppliedUpgrade {
+        old_package,
+        backup_dir,
+        backed_up_files,
+        created_files,
+        created_dirs,
+    })
+}
+
+fn rollback_applied_upgrade(root: &Path, applied: &AppliedUpgrade) -> Vec<String> {
+    let mut errors = rollback_upgrade(
+        root,
+        &applied.backup_dir,
+        &applied.backed_up_files,
+        &applied.created_files,
+        &applied.created_dirs,
+    );
+
+    if let Err(error) = database::replace_install_record(root, applied.old_package.clone()) {
+        errors.push(format!(
+            "Could not restore installed record for '{}': {error}",
+            applied.old_package.name
+        ));
+    }
+
+    errors
+}
+
+fn apply_staged_upgrades(
+    root: &Path,
+    upgrades: &[StagedUpgrade],
+    staged_packages: &[(StagedPackageDirectory, Vec<String>)],
+) -> Result<Vec<AppliedUpgrade>, String> {
+    if upgrades.len() != staged_packages.len() {
+        return Err("Upgrade and staging counts do not match".to_string());
+    }
+
+    let mut applied: Vec<AppliedUpgrade> = Vec::new();
+
+    for (upgrade, (staging, files)) in upgrades.iter().zip(staged_packages.iter()) {
+        match apply_single_upgrade(root, upgrade, &staging.path, files) {
+            Ok(journal) => applied.push(journal),
+            Err(error) => {
+                let mut rollback_errors = Vec::new();
+
+                for previous in applied.iter().rev() {
+                    rollback_errors.extend(rollback_applied_upgrade(root, previous));
+                }
+
+                if rollback_errors.is_empty() {
+                    return Err(format!(
+                        "Upgrade of '{}' failed: {error}. Earlier upgrades were rolled back.",
+                        upgrade.new_package.name
+                    ));
+                }
+
+                return Err(format!(
+                    "Upgrade of '{}' failed: {error}. Rollback failures: {}",
+                    upgrade.new_package.name,
+                    rollback_errors.join("; ")
+                ));
+            }
+        }
+    }
+
+    Ok(applied)
+}
+
+fn preview_upgrades(package_filter: Option<&str>) -> Result<(), String> {
+    if let Some(name) = package_filter {
+        if name.eq_ignore_ascii_case("vpk") {
+            println!("VPK itself is excluded from package upgrades.");
+            return Ok(());
+        }
+    }
+
+    let index = update_repository_index()?;
+
+    let home =
+        env::var_os("HOME").ok_or_else(|| "HOME environment variable is not set".to_string())?;
+
+    let root = PathBuf::from(home).join(".local/share/vpk/root");
+
+    let installed = database::list_installed(&root)
+        .map_err(|e| format!("could not read installed packages: {e}"))?;
+
+    if let Some(name) = package_filter {
+        if database::get_installed(&root, name)
+            .map_err(|e| format!("could not read package record: {e}"))?
+            .is_none()
+        {
+            return Err(format!("package '{name}' is not installed"));
+        }
+    }
+
+    let mut staged: Vec<StagedUpgrade> = Vec::new();
+    let mut staged_archives = StagedUpgradeArchives(Vec::new());
+
+    println!("Upgrade preview (no files will be changed):\n");
+
+    for package in &installed {
+        if package.name.eq_ignore_ascii_case("vpk") {
+            continue;
+        }
+
+        if let Some(filter) = package_filter {
+            if package.name != filter {
+                continue;
+            }
+        }
+
+        let available = index
+            .package
+            .iter()
+            .find(|candidate| candidate.name == package.name);
+
+        let Some(available) = available else {
+            if package_filter.is_some() {
+                return Err(format!(
+                    "package '{}' is not available in the repository",
+                    package.name
+                ));
+            }
+            continue;
+        };
+
+        if is_newer_version(&package.version, &available.version)? {
+            let (new_package, archive_path) = download_verified_package(available)?;
+            staged_archives.0.push(archive_path.clone());
+
+            let new_files = package_archive_files(&archive_path)?;
+
+            preflight_upgrade_files(&root, &package.name, &new_files)?;
+
+            for file in &package.files {
+                let owned_by_another =
+                    database::other_package_owns_file(&root, &package.name, file)
+                        .map_err(|e| format!("could not check file ownership: {e}"))?;
+
+                if owned_by_another {
+                    return Err(format!(
+                        "cannot upgrade '{}': file '{}' is also claimed by another package",
+                        package.name, file
+                    ));
+                }
+            }
+
+            staged.push(StagedUpgrade {
+                old_package: package.clone(),
+                new_package,
+                archive_path,
+                new_files,
+            });
+        }
+    }
+
+    if staged.is_empty() {
+        println!("No package upgrades available.");
+        return Ok(());
+    }
+
+    println!("\nUpgrade summary:");
+
+    for upgrade in &staged {
+        println!(
+            "  {}: {} -> {} ({} files)",
+            upgrade.old_package.name,
+            upgrade.old_package.version,
+            upgrade.new_package.version,
+            upgrade.new_files.len()
+        );
+        println!("    Staged archive: {}", upgrade.archive_path.display());
+
+        let obsolete = obsolete_package_files(&upgrade.old_package.files, &upgrade.new_files);
+
+        for file in &obsolete {
+            println!("    Remove obsolete file: {file}");
+        }
+    }
+
+    println!("\n{} package upgrade(s) available.", staged.len());
+
+    if !confirm_upgrade()? {
+        println!("Upgrade cancelled.");
+        return Ok(());
+    }
+
+    println!("\nPreparing package upgrades...");
+
+    let mut staged_packages: Vec<(StagedPackageDirectory, Vec<String>)> =
+        Vec::with_capacity(staged.len());
+
+    // Stage and verify every archive before modifying installed files.
+    for upgrade in &staged {
+        let (staging, actual_files) = stage_package_archive(
+            &upgrade.archive_path,
+            &upgrade.new_package.name,
+            &upgrade.new_package.version,
+        )?;
+
+        let mut actual_files_sorted = actual_files;
+        actual_files_sorted.sort();
+
+        let mut expected_files_sorted = upgrade.new_files.clone();
+        expected_files_sorted.sort();
+
+        if actual_files_sorted != expected_files_sorted {
+            return Err(format!(
+                "Staged files do not match the verified file list for '{}'",
+                upgrade.new_package.name
+            ));
+        }
+
+        staged_packages.push((staging, upgrade.new_files.clone()));
+    }
+
+    // Apply all upgrades as one transaction.
+    let applied = apply_staged_upgrades(&root, &staged, &staged_packages)?;
+
+    for (upgrade, journal) in staged.iter().zip(applied.iter()) {
+        println!(
+            "Successfully upgraded {}: {} -> {}",
+            upgrade.new_package.name, upgrade.old_package.version, upgrade.new_package.version
+        );
+        println!("    Backup saved at: {}", journal.backup_dir.display());
+    }
+
+    println!("\nAll package upgrades completed successfully.");
+
+    Ok(())
+}
+
+fn confirm_upgrade() -> Result<bool, String> {
+    use std::io::Write;
+
+    print!("Type 'yes' to apply these upgrades: ");
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("Could not display confirmation prompt: {e}"))?;
+
+    let mut answer = String::new();
+
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| format!("Could not read confirmation: {e}"))?;
+
+    Ok(answer.trim() == "yes")
 }
 
 fn main() {
@@ -777,6 +1992,22 @@ fn main() {
                     eprintln!("vpk: could not remove package: {error}");
                     process::exit(1);
                 }
+            }
+        }
+
+        "upgrade" => {
+            if args.len() > 3 {
+                eprintln!("Usage:");
+                eprintln!("  vpk upgrade");
+                eprintln!("  vpk upgrade <package-name>");
+                process::exit(1);
+            }
+
+            let package_filter = args.get(2).map(String::as_str);
+
+            if let Err(error) = preview_upgrades(package_filter) {
+                eprintln!("vpk: could not preview upgrades: {error}");
+                process::exit(1);
             }
         }
 
@@ -970,6 +2201,7 @@ fn main() {
             println!("  vpk <command> [arguments]");
             println!();
             println!("Commands:");
+            println!("  upgrade [package-name]          Upgrade packages after confirmation");
             println!("  update                         Refresh the repository index");
             println!("  search <query>                 Search available packages");
             println!("  install <package-name>         Install a package from the repository");
@@ -1000,6 +2232,782 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn applies_upgrade_and_removes_obsolete_files() {
+        let temp = env::temp_dir().join(format!("vpk-test-apply-upgrade-{}", process::id()));
+
+        let _ = fs::remove_dir_all(&temp);
+
+        let root = temp.join("root");
+        fs::create_dir_all(root.join("usr/share")).unwrap();
+
+        let old_hello = root.join("usr/share/hello.txt");
+        let obsolete = root.join("usr/share/obsolete.txt");
+
+        fs::write(&old_hello, "old version").unwrap();
+        fs::write(&obsolete, "obsolete file").unwrap();
+
+        let old_package = InstalledPackage {
+            name: "test-package".into(),
+            version: "1.0.0".into(),
+            description: "Old test package".into(),
+            files: vec![
+                "usr/share/hello.txt".into(),
+                "usr/share/obsolete.txt".into(),
+            ],
+            dependencies: vec![],
+        };
+
+        database::record_install(&root, old_package.clone()).unwrap();
+
+        let staged = create_staging_directory().unwrap();
+        fs::create_dir_all(staged.path.join("usr/share")).unwrap();
+
+        fs::write(staged.path.join("usr/share/hello.txt"), "upgraded version").unwrap();
+
+        fs::write(staged.path.join("usr/share/new.txt"), "new file").unwrap();
+
+        let upgrade = StagedUpgrade {
+            old_package,
+            new_package: Package {
+                name: "test-package".into(),
+                version: "2.0.0".into(),
+                description: "Upgraded test package".into(),
+                dependencies: vec![],
+            },
+            archive_path: PathBuf::new(),
+            new_files: vec!["usr/share/hello.txt".into(), "usr/share/new.txt".into()],
+        };
+
+        let applied =
+            apply_single_upgrade(&root, &upgrade, &staged.path, &upgrade.new_files).unwrap();
+
+        assert_eq!(fs::read_to_string(&old_hello).unwrap(), "upgraded version");
+        assert_eq!(
+            fs::read_to_string(root.join("usr/share/new.txt")).unwrap(),
+            "new file"
+        );
+        assert!(!obsolete.exists());
+
+        assert_eq!(
+            fs::read_to_string(applied.backup_dir.join("usr/share/hello.txt")).unwrap(),
+            "old version"
+        );
+        assert_eq!(
+            fs::read_to_string(applied.backup_dir.join("usr/share/obsolete.txt")).unwrap(),
+            "obsolete file"
+        );
+
+        let installed = database::get_installed(&root, "test-package")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(installed.version, "2.0.0");
+        assert_eq!(installed.description, "Upgraded test package");
+        assert_eq!(installed.files, upgrade.new_files);
+
+        drop(staged);
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn rolls_back_upgrade_when_staged_file_is_missing() {
+        let temp = env::temp_dir().join(format!("vpk-test-upgrade-rollback-{}", process::id()));
+
+        let _ = fs::remove_dir_all(&temp);
+
+        let root = temp.join("root");
+        fs::create_dir_all(root.join("usr/share")).unwrap();
+
+        let old_hello = root.join("usr/share/hello.txt");
+        let obsolete = root.join("usr/share/obsolete.txt");
+
+        fs::write(&old_hello, "original version").unwrap();
+        fs::write(&obsolete, "original obsolete file").unwrap();
+
+        let old_package = InstalledPackage {
+            name: "test-package".into(),
+            version: "1.0.0".into(),
+            description: "Original package".into(),
+            files: vec![
+                "usr/share/hello.txt".into(),
+                "usr/share/obsolete.txt".into(),
+            ],
+            dependencies: vec![],
+        };
+
+        database::record_install(&root, old_package.clone()).unwrap();
+
+        let staged = create_staging_directory().unwrap();
+        fs::create_dir_all(staged.path.join("usr/share")).unwrap();
+
+        fs::write(
+            staged.path.join("usr/share/hello.txt"),
+            "partially upgraded version",
+        )
+        .unwrap();
+
+        fs::write(staged.path.join("usr/share/new.txt"), "new file").unwrap();
+
+        let upgrade = StagedUpgrade {
+            old_package,
+            new_package: Package {
+                name: "test-package".into(),
+                version: "2.0.0".into(),
+                description: "Upgraded package".into(),
+                dependencies: vec![],
+            },
+            archive_path: PathBuf::new(),
+            new_files: vec!["usr/share/hello.txt".into(), "usr/share/new.txt".into()],
+        };
+
+        // Simulate a staging failure after the old files have been backed up.
+        fs::remove_file(staged.path.join("usr/share/new.txt")).unwrap();
+
+        let result = apply_single_upgrade(&root, &upgrade, &staged.path, &upgrade.new_files);
+
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&old_hello).unwrap(), "original version");
+        assert_eq!(
+            fs::read_to_string(&obsolete).unwrap(),
+            "original obsolete file"
+        );
+        assert!(!root.join("usr/share/new.txt").exists());
+
+        let installed = database::get_installed(&root, "test-package")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(installed.version, "1.0.0");
+        assert_eq!(installed.description, "Original package");
+
+        drop(staged);
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn rolls_back_entire_batch_when_later_upgrade_fails() {
+        let temp = env::temp_dir().join(format!("vpk-test-batch-rollback-{}", process::id()));
+        let _ = fs::remove_dir_all(&temp);
+
+        let root = temp.join("root");
+        fs::create_dir_all(root.join("usr/share")).unwrap();
+
+        let alpha_file = root.join("usr/share/alpha.txt");
+        let beta_file = root.join("usr/share/beta.txt");
+        fs::write(&alpha_file, "alpha original").unwrap();
+        fs::write(&beta_file, "beta original").unwrap();
+
+        let alpha_old = InstalledPackage {
+            name: "alpha".into(),
+            version: "1.0.0".into(),
+            description: "Alpha original".into(),
+            files: vec!["usr/share/alpha.txt".into()],
+            dependencies: vec![],
+        };
+        let beta_old = InstalledPackage {
+            name: "beta".into(),
+            version: "1.0.0".into(),
+            description: "Beta original".into(),
+            files: vec!["usr/share/beta.txt".into()],
+            dependencies: vec![],
+        };
+
+        database::record_install(&root, alpha_old.clone()).unwrap();
+        database::record_install(&root, beta_old.clone()).unwrap();
+
+        let alpha_staged = create_staging_directory().unwrap();
+        fs::create_dir_all(alpha_staged.path.join("usr/share")).unwrap();
+        fs::write(
+            alpha_staged.path.join("usr/share/alpha.txt"),
+            "alpha upgraded",
+        )
+        .unwrap();
+
+        let beta_staged = create_staging_directory().unwrap();
+        fs::create_dir_all(beta_staged.path.join("usr/share")).unwrap();
+        fs::write(
+            beta_staged.path.join("usr/share/beta.txt"),
+            "beta partially upgraded",
+        )
+        .unwrap();
+
+        let alpha_upgrade = StagedUpgrade {
+            old_package: alpha_old,
+            new_package: Package {
+                name: "alpha".into(),
+                version: "2.0.0".into(),
+                description: "Alpha upgraded".into(),
+                dependencies: vec![],
+            },
+            archive_path: PathBuf::new(),
+            new_files: vec!["usr/share/alpha.txt".into()],
+        };
+
+        let beta_upgrade = StagedUpgrade {
+            old_package: beta_old,
+            new_package: Package {
+                name: "beta".into(),
+                version: "2.0.0".into(),
+                description: "Beta upgraded".into(),
+                dependencies: vec![],
+            },
+            archive_path: PathBuf::new(),
+            new_files: vec!["usr/share/beta.txt".into(), "usr/share/beta-new.txt".into()],
+        };
+
+        // Force beta's upgrade to fail after alpha has already been upgraded.
+        fs::remove_file(beta_staged.path.join("usr/share/beta.txt")).unwrap();
+
+        let upgrades = vec![alpha_upgrade, beta_upgrade];
+        let staged_packages = vec![
+            (alpha_staged, vec!["usr/share/alpha.txt".to_string()]),
+            (
+                beta_staged,
+                vec![
+                    "usr/share/beta.txt".to_string(),
+                    "usr/share/beta-new.txt".to_string(),
+                ],
+            ),
+        ];
+
+        let result = apply_staged_upgrades(&root, &upgrades, &staged_packages);
+        assert!(
+            result.is_err(),
+            "batch should fail when beta's staged file is missing"
+        );
+
+        assert_eq!(fs::read_to_string(&alpha_file).unwrap(), "alpha original");
+        assert_eq!(fs::read_to_string(&beta_file).unwrap(), "beta original");
+
+        let alpha_installed = database::get_installed(&root, "alpha").unwrap().unwrap();
+        let beta_installed = database::get_installed(&root, "beta").unwrap().unwrap();
+
+        assert_eq!(alpha_installed.version, "1.0.0");
+        assert_eq!(beta_installed.version, "1.0.0");
+
+        drop(staged_packages);
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn creates_unique_upgrade_backup_directories() {
+        let temp = env::temp_dir().join(format!("vpk-test-backup-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+
+        let root = temp.join("root");
+        fs::create_dir_all(&root).unwrap();
+
+        let first = create_upgrade_backup_dir(&root).unwrap();
+
+        assert!(same_filesystem(&root, first.parent().unwrap()).unwrap());
+
+        assert!(first.is_dir());
+        assert!(first.starts_with(temp.join("vpk-upgrade-backups")));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let permissions = fs::metadata(&first).unwrap().permissions();
+            assert_eq!(permissions.mode() & 0o777, 0o700);
+        }
+
+        // Creating another backup with the same process ID must use a
+        // different directory.
+        let second = create_upgrade_backup_dir(&root).unwrap();
+        assert!(second.is_dir());
+        assert_ne!(first, second);
+
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detects_paths_on_the_same_filesystem() {
+        let temp = env::temp_dir().join(format!("vpk-test-filesystem-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+
+        assert!(same_filesystem(&temp, &temp).unwrap());
+
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn backs_up_upgrade_file_and_preserves_contents() {
+        let temp = env::temp_dir().join(format!("vpk-test-backup-file-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+
+        let root = temp.join("root");
+        fs::create_dir_all(root.join("bin")).unwrap();
+
+        let backup_dir = temp.join("backup");
+        fs::create_dir_all(&backup_dir).unwrap();
+
+        let source = root.join("bin/tool");
+        fs::write(&source, "original contents").unwrap();
+
+        backup_upgrade_file(&root, &backup_dir, Path::new("bin/tool")).unwrap();
+
+        assert!(!source.exists());
+
+        assert_eq!(
+            fs::read_to_string(backup_dir.join("bin/tool")).unwrap(),
+            "original contents"
+        );
+
+        restore_upgrade_file(&root, &backup_dir, Path::new("bin/tool")).unwrap();
+
+        assert_eq!(fs::read_to_string(&source).unwrap(), "original contents");
+        assert!(!backup_dir.join("bin/tool").exists());
+
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn backs_up_existing_package_files_and_skips_missing_files() {
+        let temp = env::temp_dir().join(format!(
+            "vpk-test-backup-package-files-{}",
+            std::process::id()
+        ));
+
+        let _ = fs::remove_dir_all(&temp);
+
+        let root = temp.join("root");
+        fs::create_dir_all(root.join("bin")).unwrap();
+
+        let backup_dir = temp.join("backup");
+        fs::create_dir_all(&backup_dir).unwrap();
+
+        let source = root.join("bin/tool");
+        fs::write(&source, "original contents").unwrap();
+
+        let old_files = vec!["bin/tool".to_string(), "bin/missing-tool".to_string()];
+
+        let backed_up =
+            backup_existing_package_files(&root, &backup_dir, "demo", &old_files).unwrap();
+
+        assert_eq!(backed_up, vec!["bin/tool".to_string()]);
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read_to_string(backup_dir.join("bin/tool")).unwrap(),
+            "original contents"
+        );
+
+        restore_upgrade_file(&root, &backup_dir, Path::new("bin/tool")).unwrap();
+        assert_eq!(fs::read_to_string(&source).unwrap(), "original contents");
+
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn restores_backed_up_files_when_later_file_is_owned_by_another_package() {
+        let temp = env::temp_dir().join(format!("vpk-test-backup-rollback-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&temp);
+
+        let root = temp.join("root");
+        fs::create_dir_all(root.join("bin")).unwrap();
+
+        let backup_dir = temp.join("backup");
+        fs::create_dir_all(&backup_dir).unwrap();
+
+        let first_file = root.join("bin/first-tool");
+        let shared_file = root.join("bin/shared-tool");
+
+        fs::write(&first_file, "original first file").unwrap();
+        fs::write(&shared_file, "shared file").unwrap();
+
+        database::record_install(
+            &root,
+            database::InstalledPackage {
+                name: "other-package".into(),
+                version: "1.0.0".into(),
+                description: "Another package".into(),
+                files: vec!["bin/shared-tool".into()],
+                dependencies: vec![],
+            },
+        )
+        .unwrap();
+
+        let old_files = vec!["bin/first-tool".to_string(), "bin/shared-tool".to_string()];
+
+        let result = backup_existing_package_files(&root, &backup_dir, "my-package", &old_files);
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(&first_file).unwrap(),
+            "original first file"
+        );
+        assert!(!backup_dir.join("bin/first-tool").exists());
+        assert_eq!(fs::read_to_string(&shared_file).unwrap(), "shared file");
+
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn refuses_to_overwrite_existing_restore_destination() {
+        let temp =
+            env::temp_dir().join(format!("vpk-test-restore-existing-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&temp);
+
+        let root = temp.join("root");
+        let backup_dir = temp.join("backup");
+
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::create_dir_all(backup_dir.join("bin")).unwrap();
+
+        let destination = root.join("bin/tool");
+        let backup = backup_dir.join("bin/tool");
+
+        fs::write(&destination, "new file contents").unwrap();
+        fs::write(&backup, "original contents").unwrap();
+
+        assert!(restore_upgrade_file(&root, &backup_dir, Path::new("bin/tool")).is_err());
+
+        assert_eq!(
+            fs::read_to_string(&destination).unwrap(),
+            "new file contents"
+        );
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "original contents");
+
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_symlinked_backup_parent_during_restore() {
+        use std::os::unix::fs::symlink;
+
+        let temp = env::temp_dir().join(format!("vpk-test-restore-symlink-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&temp);
+
+        let root = temp.join("root");
+        let backup_dir = temp.join("backup");
+        let outside = temp.join("outside");
+
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        fs::write(outside.join("tool"), "outside contents").unwrap();
+        symlink(&outside, backup_dir.join("bin")).unwrap();
+
+        assert!(restore_upgrade_file(&root, &backup_dir, Path::new("bin/tool")).is_err());
+
+        assert_eq!(
+            fs::read_to_string(outside.join("tool")).unwrap(),
+            "outside contents"
+        );
+        assert!(!root.join("bin/tool").exists());
+
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn refuses_to_overwrite_existing_upgrade_backup() {
+        let temp = env::temp_dir().join(format!("vpk-test-backup-existing-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&temp);
+        let root = temp.join("root");
+        let backup_dir = temp.join("backup");
+
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::create_dir_all(backup_dir.join("bin")).unwrap();
+
+        let source = root.join("bin/tool");
+        let backup = backup_dir.join("bin/tool");
+
+        fs::write(&source, "original contents").unwrap();
+        fs::write(&backup, "existing backup").unwrap();
+
+        assert!(backup_upgrade_file(&root, &backup_dir, Path::new("bin/tool")).is_err());
+
+        assert_eq!(fs::read_to_string(&source).unwrap(), "original contents");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "existing backup");
+
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_symlinked_upgrade_backup_directory() {
+        let temp = env::temp_dir().join(format!("vpk-test-backup-symlink-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&temp);
+
+        let root = temp.join("root");
+        let backup_dir = temp.join("backup");
+        let outside = temp.join("outside");
+
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        let source = root.join("bin/tool");
+        fs::write(&source, "original contents").unwrap();
+
+        std::os::unix::fs::symlink(&outside, backup_dir.join("bin")).unwrap();
+
+        assert!(backup_upgrade_file(&root, &backup_dir, Path::new("bin/tool")).is_err());
+        assert_eq!(fs::read_to_string(&source).unwrap(), "original contents");
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn refuses_symlinked_existing_parent_directory() {
+        let temp = env::temp_dir().join(format!("vpk-test-parent-symlink-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&temp);
+
+        let base = temp.join("base");
+        let outside = temp.join("outside");
+
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        std::os::unix::fs::symlink(&outside, base.join("bin")).unwrap();
+
+        assert!(check_existing_parent_directories(&base, Path::new("bin/tool")).is_err());
+
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn lists_old_files_to_back_up_without_duplicates() {
+        let old_files = vec![
+            "usr/bin/tool".to_string(),
+            "usr/share/tool/data.txt".to_string(),
+            "usr/bin/tool".to_string(),
+        ];
+
+        assert_eq!(
+            upgrade_files_to_backup(&old_files),
+            vec![
+                "usr/bin/tool".to_string(),
+                "usr/share/tool/data.txt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn identifies_obsolete_package_files() {
+        let old_files = vec![
+            "bin/tool".to_string(),
+            "share/old-data".to_string(),
+            "etc/tool.conf".to_string(),
+        ];
+
+        let new_files = vec!["bin/tool".to_string(), "share/new-data".to_string()];
+
+        assert_eq!(
+            obsolete_package_files(&old_files, &new_files),
+            vec!["etc/tool.conf".to_string(), "share/old-data".to_string()]
+        );
+    }
+
+    #[test]
+    fn finds_no_obsolete_files_when_all_files_are_retained() {
+        let old_files = vec!["bin/tool".to_string(), "share/data".to_string()];
+        let new_files = vec!["bin/tool".to_string(), "share/data".to_string()];
+
+        assert!(obsolete_package_files(&old_files, &new_files).is_empty());
+    }
+
+    #[test]
+    fn detects_newer_semantic_versions() {
+        assert!(is_newer_version("0.2.9", "0.2.10").unwrap());
+        assert!(is_newer_version("0.2.75", "0.3.0").unwrap());
+    }
+
+    #[test]
+    fn validates_complete_package_archive() {
+        let temp = env::temp_dir().join(format!("vpk-test-validate-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+
+        let package_dir = create_test_package(&temp);
+        let archive_path = temp.join("test-package.vpk");
+
+        pack_package(
+            package_dir.to_str().unwrap(),
+            archive_path.to_str().unwrap(),
+        )
+        .unwrap();
+
+        let package = validate_package_archive(&archive_path, "test-package", "1.0.0").unwrap();
+
+        assert_eq!(package.name, "test-package");
+        assert_eq!(package.version, "1.0.0");
+
+        let files = package_archive_files(&archive_path).unwrap();
+
+        assert_eq!(files, vec!["usr/share/hello.txt".to_string()]);
+
+        assert!(validate_package_archive(&archive_path, "wrong-name", "1.0.0",).is_err());
+
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn stages_package_archive_and_cleans_up_on_drop() {
+        let temp = env::temp_dir().join(format!("vpk-test-stage-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+
+        let package_dir = create_test_package(&temp);
+        let archive_path = temp.join("test-package.vpk");
+
+        pack_package(
+            package_dir.to_str().unwrap(),
+            archive_path.to_str().unwrap(),
+        )
+        .unwrap();
+
+        let (staged, files) =
+            stage_package_archive(&archive_path, "test-package", "1.0.0").unwrap();
+
+        assert_eq!(files, vec!["usr/share/hello.txt".to_string()]);
+        assert_eq!(
+            fs::read_to_string(staged.path.join("usr/share/hello.txt")).unwrap(),
+            "Hello from VPK tests!"
+        );
+
+        let staging_path = staged.path.clone();
+        drop(staged);
+
+        assert!(!staging_path.exists());
+
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn installs_staged_file_into_target() {
+        let temp = env::temp_dir().join(format!("vpk-test-staged-install-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&temp);
+
+        let staging_root = temp.join("staging");
+        let install_root = temp.join("install");
+
+        fs::create_dir_all(staging_root.join("usr/share")).unwrap();
+        fs::create_dir_all(&install_root).unwrap();
+
+        fs::write(
+            staging_root.join("usr/share/hello.txt"),
+            "Hello from staged VPK!",
+        )
+        .unwrap();
+
+        let mut created_files = Vec::new();
+        let mut created_dirs = Vec::new();
+
+        install_staged_file(
+            &staging_root,
+            &install_root,
+            Path::new("usr/share/hello.txt"),
+            &mut created_files,
+            &mut created_dirs,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(install_root.join("usr/share/hello.txt")).unwrap(),
+            "Hello from staged VPK!"
+        );
+
+        assert_eq!(
+            created_files,
+            vec![install_root.join("usr/share/hello.txt")]
+        );
+        assert_eq!(
+            created_dirs,
+            vec![install_root.join("usr"), install_root.join("usr/share")]
+        );
+
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn refuses_to_overwrite_existing_staged_install_target() {
+        let temp =
+            env::temp_dir().join(format!("vpk-test-staged-overwrite-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&temp);
+
+        let staging_root = temp.join("staging");
+        let install_root = temp.join("install");
+        let relative = Path::new("usr/share/hello.txt");
+
+        fs::create_dir_all(staging_root.join("usr/share")).unwrap();
+        fs::create_dir_all(install_root.join("usr/share")).unwrap();
+
+        fs::write(staging_root.join(relative), "New contents").unwrap();
+        fs::write(install_root.join(relative), "Original contents").unwrap();
+
+        let mut created_files = Vec::new();
+        let mut created_dirs = Vec::new();
+
+        let result = install_staged_file(
+            &staging_root,
+            &install_root,
+            relative,
+            &mut created_files,
+            &mut created_dirs,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(install_root.join(relative)).unwrap(),
+            "Original contents"
+        );
+        assert!(created_files.is_empty());
+        assert!(created_dirs.is_empty());
+
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn staging_directory_guard_removes_partial_files_on_drop() {
+        let staged = create_staging_directory().unwrap();
+        let staging_path = staged.path.clone();
+
+        fs::create_dir_all(staged.path.join("usr/share")).unwrap();
+        fs::write(staged.path.join("usr/share/partial.txt"), "partial").unwrap();
+
+        assert!(staging_path.join("usr/share/partial.txt").exists());
+
+        drop(staged);
+
+        assert!(!staging_path.exists());
+    }
+
+    #[test]
+    fn does_not_treat_equal_or_older_versions_as_upgrades() {
+        assert!(!is_newer_version("0.2.10", "0.2.10").unwrap());
+        assert!(!is_newer_version("0.3.0", "0.2.75").unwrap());
+    }
+
+    #[test]
+    fn rejects_invalid_semantic_versions() {
+        assert!(is_newer_version("not-a-version", "1.0.0").is_err());
+        assert!(is_newer_version("1.0.0", "also-invalid").is_err());
+    }
+
     fn create_test_package(base: &Path) -> PathBuf {
         let package_dir = base.join("test-package");
         fs::create_dir_all(package_dir.join("data/usr/share")).unwrap();
@@ -1030,6 +3038,74 @@ description = "A test package"
             package_data_path(Path::new("data/usr/share/hello.txt")).unwrap(),
             PathBuf::from("usr/share/hello.txt")
         );
+    }
+
+    #[test]
+    fn checks_upgrade_paths_safely() {
+        let temp =
+            std::env::temp_dir().join(format!("vpk-upgrade-path-test-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&temp);
+        let root = temp.join("root");
+        fs::create_dir_all(root.join("bin")).unwrap();
+
+        fs::write(root.join("bin/tool"), "old version").unwrap();
+
+        assert!(check_upgrade_path(&root, Path::new("bin/tool")).unwrap());
+        assert!(!check_upgrade_path(&root, Path::new("bin/missing")).unwrap());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("tool", root.join("bin/link")).unwrap();
+            assert!(check_upgrade_path(&root, Path::new("bin/link")).is_err());
+        }
+
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_symlinked_install_root() {
+        let temp =
+            std::env::temp_dir().join(format!("vpk-symlink-root-test-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&temp);
+
+        let real_root = temp.join("real-root");
+        let linked_root = temp.join("linked-root");
+
+        fs::create_dir_all(&real_root).unwrap();
+        std::os::unix::fs::symlink(&real_root, &linked_root).unwrap();
+
+        assert!(check_upgrade_path(&linked_root, Path::new("bin/tool")).is_err());
+
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn preflight_rejects_files_owned_by_another_package() {
+        let temp = std::env::temp_dir().join(format!("vpk-preflight-test-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+
+        database::record_install(
+            &temp,
+            database::InstalledPackage {
+                name: "other-package".into(),
+                version: "1.0.0".into(),
+                description: "Another package".into(),
+                files: vec!["usr/bin/shared-tool".into()],
+                dependencies: vec![],
+            },
+        )
+        .unwrap();
+
+        let files = vec!["usr/bin/shared-tool".to_string()];
+
+        assert!(preflight_upgrade_files(&temp, "my-package", &files).is_err());
+
+        fs::remove_dir_all(&temp).unwrap();
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::{
     process,
 };
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledPackage {
     pub name: String,
     pub version: String,
@@ -87,6 +87,67 @@ pub fn record_install(root: &Path, package: InstalledPackage) -> io::Result<()> 
     // failed install while leaving a successfully published record behind.
     let _ = fs::remove_file(&temporary_path);
 
+    result
+}
+
+pub fn replace_install_record(root: &Path, package: InstalledPackage) -> io::Result<()> {
+    // Only replace a record that already exists for this package.
+    let existing = get_installed(root, &package.name)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Package '{}' is not installed", package.name),
+        )
+    })?;
+
+    if existing.name != package.name {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Package name does not match existing record",
+        ));
+    }
+
+    let directory = database_directory(root);
+    let destination = directory.join(format!("{}.toml", package.name));
+    let contents = toml::to_string_pretty(&package).map_err(io::Error::other)?;
+
+    // Write the complete replacement to a unique temporary file first.
+    let mut temporary = None;
+
+    for attempt in 0..100 {
+        let path = directory.join(format!(
+            ".{}.toml.upgrade-{}-{attempt}",
+            package.name,
+            process::id()
+        ));
+
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => {
+                temporary = Some((path, file));
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    let (temporary_path, mut file) = temporary.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "Could not find an available temporary database filename",
+        )
+    })?;
+
+    let result = (|| -> io::Result<()> {
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+
+        // On Linux, rename atomically replaces the old record.
+        fs::rename(&temporary_path, &destination)?;
+        Ok(())
+    })();
+
+    let _ = fs::remove_file(&temporary_path);
     result
 }
 
@@ -310,4 +371,146 @@ mod tests {
 
         fs::remove_dir_all(&root).unwrap();
     }
+
+    #[test]
+    fn upgrade_replaces_existing_install_record() {
+        let root = std::env::temp_dir().join(format!("vpk-db-upgrade-test-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        record_install(
+            &root,
+            InstalledPackage {
+                name: "upgrade-test".into(),
+                version: "1.0.0".into(),
+                description: "Old version".into(),
+                files: vec!["usr/bin/old".into()],
+                dependencies: vec![],
+            },
+        )
+        .unwrap();
+
+        replace_install_record(
+            &root,
+            InstalledPackage {
+                name: "upgrade-test".into(),
+                version: "2.0.0".into(),
+                description: "New version".into(),
+                files: vec!["usr/bin/new".into()],
+                dependencies: vec!["dependency-test".into()],
+            },
+        )
+        .unwrap();
+
+        let installed = get_installed(&root, "upgrade-test").unwrap().unwrap();
+
+        assert_eq!(installed.version, "2.0.0");
+        assert_eq!(installed.description, "New version");
+        assert_eq!(installed.files, vec!["usr/bin/new"]);
+        assert_eq!(installed.dependencies, vec!["dependency-test"]);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn upgrade_refuses_missing_install_record() {
+        let root = std::env::temp_dir().join(format!(
+            "vpk-db-upgrade-missing-test-{}",
+            std::process::id()
+        ));
+
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let result = replace_install_record(
+            &root,
+            InstalledPackage {
+                name: "not-installed".into(),
+                version: "2.0.0".into(),
+                description: "New version".into(),
+                files: vec![],
+                dependencies: vec![],
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(get_installed(&root, "not-installed").unwrap().is_none());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn detects_files_owned_by_another_package() {
+        let root =
+            std::env::temp_dir().join(format!("vpk-db-ownership-test-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        record_install(
+            &root,
+            InstalledPackage {
+                name: "package-a".into(),
+                version: "1.0.0".into(),
+                description: "Package A".into(),
+                files: vec!["usr/bin/shared-tool".into()],
+                dependencies: vec![],
+            },
+        )
+        .unwrap();
+
+        record_install(
+            &root,
+            InstalledPackage {
+                name: "package-b".into(),
+                version: "1.0.0".into(),
+                description: "Package B".into(),
+                files: vec!["usr/bin/other-tool".into()],
+                dependencies: vec![],
+            },
+        )
+        .unwrap();
+
+        assert!(other_package_owns_file(&root, "package-b", "usr/bin/shared-tool").unwrap());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn does_not_treat_current_package_as_another_owner() {
+        let root =
+            std::env::temp_dir().join(format!("vpk-db-ownership-self-test-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        record_install(
+            &root,
+            InstalledPackage {
+                name: "package-a".into(),
+                version: "1.0.0".into(),
+                description: "Package A".into(),
+                files: vec!["usr/bin/my-tool".into()],
+                dependencies: vec![],
+            },
+        )
+        .unwrap();
+
+        assert!(!other_package_owns_file(&root, "package-a", "usr/bin/my-tool").unwrap());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+pub fn other_package_owns_file(
+    root: &Path,
+    current_package: &str,
+    file_path: &str,
+) -> io::Result<bool> {
+    let packages = list_installed(root)?;
+
+    Ok(packages.iter().any(|package| {
+        package.name != current_package && package.files.iter().any(|file| file == file_path)
+    }))
 }
